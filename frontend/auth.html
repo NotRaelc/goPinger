@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>goPinger // auth</title>
+<link rel="stylesheet" href="/static/common.css">
+<link rel="stylesheet" href="/static/auth.css">
+<script src="/static/auth.js" defer></script>
+</head>
+<body>
+
+<div id="login">
+  <div class="box">
+    <h1>goPinger // auth</h1>
+
+    <div class="tabs">
+      <button type="button" id="tabLogin" class="on">ВОЙТИ</button>
+      <button type="button" id="tabReg">РЕГИСТРАЦИЯ</button>
+    </div>
+
+    <form id="authForm">
+      <input id="lUser"  placeholder="username" autocomplete="username" required>
+      <input id="lPass"  type="password" placeholder="password" autocomplete="current-password" required>
+      <input id="lPass2" type="password" placeholder="повторите пароль" autocomplete="new-password" hidden>
+      <button type="submit" id="authBtn">ВОЙТИ</button>
+    </form>
+
+    <div class="err" id="lErr"></div>
+  </div>
+</div>
+
+</body>
+</html>
