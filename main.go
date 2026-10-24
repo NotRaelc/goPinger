@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"log/slog"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -30,9 +34,11 @@ func initDb(ctx context.Context) error {
 }
 
 func main() {
-	ctx := context.Background()
-	if err := initDb(ctx); err != nil {
-		panic(err)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if dbInitErr := initDb(ctx); dbInitErr != nil {
+		panic(dbInitErr)
 	}
 	validate = validator.New(validator.WithRequiredStructEnabled())
 
@@ -45,10 +51,34 @@ func main() {
 		LoggingMiddleware,   // лог запроса
 		CORSMiddleware,      // CORS/preflight (внутри логов)
 	)
-
-	serverErr := http.ListenAndServe(":8080", handler)
-	if serverErr != nil {
-		panic(serverErr)
+	srv := &http.Server{ // Нашел оптимизированный сервер
+		Addr:              ":8080",
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,  // ← ключевой: время на чтение заголовков
+		ReadTimeout:       15 * time.Second, // ← всё тело запроса целиком
+		WriteTimeout:      15 * time.Second, // ← запись ответа
+		IdleTimeout:       60 * time.Second, // ← keep-alive простой
+		MaxHeaderBytes:    1 << 20,          // ← 1 MiB на заголовки (защита от header-flood)
 	}
-	fmt.Println(os.Getenv("DATABASE_URL"))
+
+	go func() {
+		if serverErr := srv.ListenAndServe(); serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+			slog.Error("HTTP server error", "err", serverErr)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Warn("Shutting down...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Graceful shutdown failed, forcing close", "err", err)
+		if closeErr := srv.Close(); closeErr != nil {
+			slog.Error("Force close failed", "err", closeErr)
+		}
+	}
+
+	slog.Info("Stopped")
 }

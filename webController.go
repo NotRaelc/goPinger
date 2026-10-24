@@ -18,7 +18,7 @@ func deleteCookieToken(w http.ResponseWriter) {
 }
 
 func setCookieToken(w http.ResponseWriter, tokenValue string) {
-	expiredCookie := &http.Cookie{ // 400 days is browser limit
+	expiredCookie := &http.Cookie{ // Лимит браузера - 400 дней
 		Name:     "token",
 		Value:    tokenValue,
 		Path:     "/",

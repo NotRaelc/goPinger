@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 const tokenLength = 32
@@ -35,17 +36,19 @@ func readUsernameByToken(ctx context.Context, token string) (User, error) {
 	return user, err
 }
 
+// FIXME: Срок в 400 дней пока что не работает
 func insertUser(ctx context.Context, user User) error {
 	_, err := pool.Exec(ctx, `
-	INSERT INTO users(username, hash, token) VALUES ($1, $2, $3)
-`, user.Username, user.Hash, user.Token)
+	INSERT INTO users(username, hash, token, token_expires_at) VALUES ($1, $2, $3, $4)
+`, user.Username, user.Hash, user.Token, time.Now().Add(400*24*time.Hour))
 	return err
 }
 
+// FIXME: Срок в 400 дней пока что не работает
 func updateUserToken(ctx context.Context, user User) error {
 	_, err := pool.Exec(ctx, `
-	UPDATE users SET token = $1 WHERE username = $2
-`, user.Token, user.Username)
+	UPDATE users SET token = $1, token_expires_at = $2 WHERE username = $3
+`, user.Token, time.Now().Add(400*24*time.Hour), user.Username)
 	return err
 }
 

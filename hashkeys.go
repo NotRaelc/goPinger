@@ -20,7 +20,7 @@ const (
 	saltLen      = 16        // Длина соли (16 байт)
 )
 
-// Vibecoded stuff, sorry ;)
+// Вайбкод, это не что-то уникальное в проектировании ;)
 func generatePasswordHash(password string) (string, error) {
 	salt := make([]byte, saltLen)
 	if _, err := rand.Read(salt); err != nil {
@@ -31,7 +31,7 @@ func generatePasswordHash(password string) (string, error) {
 	encodedSalt := b64.EncodeToString(salt)
 	encodedKey := b64.EncodeToString(key)
 
-	// Format: $argon2id$v=19$m=...,t=...,p=...$salt$hash
+	// Формат: $argon2id$v=19$m=...,t=...,p=...$salt$hash
 	return fmt.Sprintf(
 		"$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		argon2.Version, argonMemory, argonTime, argonThreads, encodedSalt, encodedKey,

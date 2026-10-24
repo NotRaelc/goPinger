@@ -89,7 +89,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		// А если да, то пропускаем
 		_, readErr := readUsernameByToken(r.Context(), tokenCookie.Value)
 		if readErr != nil {
-			deleteCookieToken(w) // TODO: Use another lib with validation
+			deleteCookieToken(w) // TODO: Заменить на redis мб
 			http.Redirect(w, r, "/auth", http.StatusSeeOther)
 			return
 		}
@@ -120,7 +120,7 @@ func NoCacheMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, must-revalidate")
 		w.Header().Set("Pragma", "no-cache") // для очень старых прокси
-		w.Header().Set("Expires", "0")       // то же
+		w.Header().Set("Expires", "0")       // тоже
 		next.ServeHTTP(w, r)
 	})
 }
