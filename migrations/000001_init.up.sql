@@ -1,10 +1,12 @@
 CREATE TABLE IF NOT EXISTS users(
-                       username VARCHAR NOT NULL,
+                       username VARCHAR(32) NOT NULL,
                        hash VARCHAR NOT NULL,
                        token VARCHAR,
-                       token_expires_at TIME,
+                       token_expires_at TIMESTAMPTZ,
 
-                       UNIQUE(username)
+                       UNIQUE(username),
+                       UNIQUE(hash),
+                       UNIQUE(token)
 );
 /*
 CREATE TABLE ServerTypes (

@@ -11,23 +11,21 @@ import (
 	"os"
 )
 
-type userInput struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
 func initDb(ctx context.Context) error {
 	mPool, dbErr := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
 	if dbErr != nil {
 		return dbErr
 	}
-	dbPingErr := mPool.Ping(ctx)
-	if dbPingErr != nil {
+
+	if dbPingErr := mPool.Ping(ctx); dbPingErr != nil {
 		return dbPingErr
 	}
 	pool = mPool
+	checkNames := []string{"users"}
+	if checkPages := checkDbPages(ctx, checkNames...); checkPages != nil {
+		return checkPages
+	}
 
-	initDbPageUsers(ctx, pool)
 	return nil
 }
 

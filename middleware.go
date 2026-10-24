@@ -87,7 +87,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		// Далее сверка с базой данных
 		// И если нет, то сбрасываем
 		// А если да, то пропускаем
-		_, readErr := readUserByToken(r.Context(), tokenCookie.Value)
+		_, readErr := readUsernameByToken(r.Context(), tokenCookie.Value)
 		if readErr != nil {
 			deleteCookieToken(w) // TODO: Use another lib with validation
 			http.Redirect(w, r, "/auth", http.StatusSeeOther)
@@ -107,7 +107,7 @@ func SuccessRedirectMiddleware(next http.Handler) http.Handler {
 		// Далее сверка с базой данных
 		// И если нет, то сбрасываем
 		// А если да, то пропускаем
-		_, readErr := readUserByToken(r.Context(), tokenCookie.Value)
+		_, readErr := readUsernameByToken(r.Context(), tokenCookie.Value)
 		if readErr == nil {
 			http.Redirect(w, r, "/app", http.StatusSeeOther)
 			return

@@ -4,23 +4,17 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const tokenLength = 32
 
-func initDbPageUsers(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, `
-	CREATE TABLE IF NOT EXISTS users (
-                       username VARCHAR NOT NULL,
-                       hash VARCHAR NOT NULL,
-                       token VARCHAR,
-                       /*token_expires_at TIME,*/
-
-                       UNIQUE(username))
-`)
-	return err
+func checkDbPages(ctx context.Context, names ...string) error {
+	for _, name := range names {
+		if _, checkErr := pool.Exec(ctx, "SELECT $1::regclass;", name); checkErr != nil {
+			return checkErr
+		}
+	}
+	return nil
 }
 
 func readUserByUsername(ctx context.Context, username string) (User, error) {
@@ -32,12 +26,12 @@ func readUserByUsername(ctx context.Context, username string) (User, error) {
 	return user, err
 }
 
-func readUserByToken(ctx context.Context, token string) (User, error) {
+func readUsernameByToken(ctx context.Context, token string) (User, error) {
 	var user User
 	err := pool.QueryRow(ctx, `
-	SELECT username, hash, token FROM users
+	SELECT username, token FROM users
 	WHERE token = $1
-`, token).Scan(&user.Username, &user.Hash, &user.Token)
+`, token).Scan(&user.Username, &user.Token)
 	return user, err
 }
 
