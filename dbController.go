@@ -9,61 +9,57 @@ import (
 
 const tokenLength = 32
 
-func checkDbPages(ctx context.Context, names ...string) error {
-	for _, name := range names {
-		if _, checkErr := pool.Exec(ctx, "SELECT $1::regclass;", name); checkErr != nil {
-			return checkErr
-		}
-	}
-	return nil
-}
-
 func readUserByUsername(ctx context.Context, username string) (User, error) {
 	var user User
 	err := pool.QueryRow(ctx, `
-	SELECT username, hash, token FROM users
-	WHERE username = $1
-`, username).Scan(&user.Username, &user.Hash, &user.Token)
+		SELECT username, hash, COALESCE(token, '') FROM users WHERE username = $1
+	`, username).Scan(&user.Username, &user.Hash, &user.Token)
 	return user, err
 }
 
-func readUsernameByToken(ctx context.Context, token string) (User, error) {
+// Проверяем и токен, и срок его действия.
+func readUserByToken(ctx context.Context, token string) (User, error) {
 	var user User
 	err := pool.QueryRow(ctx, `
-	SELECT username, token FROM users
-	WHERE token = $1
-`, token).Scan(&user.Username, &user.Token)
+		SELECT username, token FROM users
+		WHERE token = $1 AND (token_expires_at IS NULL OR token_expires_at > NOW())
+	`, token).Scan(&user.Username, &user.Token)
 	return user, err
 }
 
-// FIXME: Срок в 400 дней пока что не работает
 func insertUser(ctx context.Context, user User) error {
 	_, err := pool.Exec(ctx, `
-	INSERT INTO users(username, hash, token, token_expires_at) VALUES ($1, $2, $3, $4)
-`, user.Username, user.Hash, user.Token, time.Now().Add(400*24*time.Hour))
+		INSERT INTO users(username, hash, token, token_expires_at)
+		VALUES ($1, $2, $3, $4)
+	`, user.Username, user.Hash, user.Token, time.Now().Add(400*24*time.Hour))
 	return err
 }
 
-// FIXME: Срок в 400 дней пока что не работает
 func updateUserToken(ctx context.Context, user User) error {
 	_, err := pool.Exec(ctx, `
-	UPDATE users SET token = $1, token_expires_at = $2 WHERE username = $3
-`, user.Token, time.Now().Add(400*24*time.Hour), user.Username)
+		UPDATE users SET token = $1, token_expires_at = $2 WHERE username = $3
+	`, user.Token, time.Now().Add(400*24*time.Hour), user.Username)
+	return err
+}
+
+func clearUserToken(ctx context.Context, token string) error {
+	_, err := pool.Exec(ctx, `
+		UPDATE users SET token = NULL, token_expires_at = NULL WHERE token = $1
+	`, token)
 	return err
 }
 
 func validateRegister(w http.ResponseWriter, r *http.Request, regUser RegisterUser) error {
-	hash, hashError := generatePasswordHash(regUser.Password)
-	if hashError != nil {
-		return hashError
+	hash, err := generatePasswordHash(regUser.Password)
+	if err != nil {
+		return err
 	}
-	tokenValue, tokenErr := generateUserToken(tokenLength)
-	if tokenErr != nil {
-		return tokenErr
+	tokenValue, err := generateUserToken(tokenLength)
+	if err != nil {
+		return err
 	}
 	user := User{Username: regUser.Username, Hash: hash, Token: tokenValue}
-	err := insertUser(r.Context(), user)
-	if err != nil {
+	if err := insertUser(r.Context(), user); err != nil {
 		return err
 	}
 	setCookieToken(w, tokenValue)
@@ -71,24 +67,24 @@ func validateRegister(w http.ResponseWriter, r *http.Request, regUser RegisterUs
 }
 
 func validateLogin(w http.ResponseWriter, r *http.Request, logUser LoginUser) error {
-	readUser, readUserErr := readUserByUsername(r.Context(), logUser.Username)
-	if readUserErr != nil {
-		return readUserErr
+	readUser, err := readUserByUsername(r.Context(), logUser.Username)
+	if err != nil {
+		return err
 	}
-	hashValidation, hashErr := validatePasswordHash(logUser.Password, readUser.Hash)
-	if hashErr != nil {
-		return hashErr
-	} else if !hashValidation {
+	ok, err := validatePasswordHash(logUser.Password, readUser.Hash)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return fmt.Errorf("invalid password")
 	}
-	tokenValue, tokenErr := generateUserToken(tokenLength)
-	if tokenErr != nil {
-		return tokenErr
+	tokenValue, err := generateUserToken(tokenLength)
+	if err != nil {
+		return err
 	}
 	user := User{Username: logUser.Username, Token: tokenValue}
-	updateUserErr := updateUserToken(r.Context(), user) // Just updating token. TODO: Store tokens with Redis.
-	if updateUserErr != nil {
-		return updateUserErr
+	if err := updateUserToken(r.Context(), user); err != nil {
+		return err
 	}
 	setCookieToken(w, tokenValue)
 	return nil

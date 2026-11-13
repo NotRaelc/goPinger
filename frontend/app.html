@@ -12,7 +12,9 @@
 
 <header>
   <div class="logo">[ goPinger ]</div>
+  <span class="live" id="live">○ OFFLINE</span>
   <div>
+    <span class="live" id="live">○ OFFLINE</span>
     <span class="who" id="who"></span>
     <button class="ghost" onclick="logout()">ВЫЙТИ</button>
   </div>
@@ -69,8 +71,8 @@
       <option value="4">MINECRAFT BEDROCK</option>
       <option value="1">SOURCE (A2S)</option>
     </select>
-    <label>ИНТЕРВАЛ ОПРОСА (сек)</label>
-    <input id="fInterval" type="number" min="5" value="60">
+    <label>ИНТЕРВАЛ ОПРОСА (сек, 0 = авто по типу)</label>
+	<input id="fInterval" type="number" min="0" value="0">
     <label>МЕТКА (необязательно)</label>
     <input id="fLabel" placeholder="prod / dev / любимый сервер">
     <div class="actions">

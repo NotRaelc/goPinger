@@ -55,3 +55,14 @@ a:hover{text-decoration:underline}
   color:var(--dim);background:#131922}
 .cell-trunc{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   display:inline-block;vertical-align:bottom}
+
+.live{font-size:11px;letter-spacing:1px;color:var(--dim);margin-right:14px;
+  transition:color .2s ease}
+.srv-img{width:40px;height:40px;object-fit:cover;image-rendering:pixelated;
+  border:1px solid var(--line);background:#000;display:block}
+
+@keyframes rowflash {
+  0%   { background: rgba(111, 199, 154, .30); }
+  100% { background: transparent; }
+}
+tr.flash > td{animation: rowflash 1.5s ease-out}

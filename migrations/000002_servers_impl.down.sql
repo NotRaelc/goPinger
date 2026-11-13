@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS server_states;
+DROP TABLE IF EXISTS servers;
