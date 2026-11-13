@@ -3,6 +3,9 @@ header{background:var(--panel);border-bottom:2px solid var(--line);
 header .logo{color:var(--acc);font-weight:700;letter-spacing:3px}
 header .who{color:var(--dim);margin-right:12px}
 
+.live{font-size:11px;letter-spacing:1px;color:var(--dim);margin-right:14px;
+  transition:color .2s ease}
+
 .checker{padding:22px 20px;background:var(--bg);border-bottom:1px solid var(--line-soft)}
 .checker .sec-h{margin-bottom:12px}
 .checker .row{display:flex;gap:8px;max-width:1000px}
@@ -21,6 +24,7 @@ main{padding:22px 20px}
   border-left:1px solid var(--line);padding-left:14px}
 .toolbar .hint b{color:var(--acc2);font-weight:700}
 .toolbar .right{display:flex;gap:8px;align-items:center}
+.search-input{max-width:260px;height:28px;font-size:12px}
 
 .colpicker{position:relative;display:inline-block}
 .colpicker-menu{display:none;position:absolute;right:0;top:calc(100% + 6px);
@@ -55,8 +59,15 @@ tr.expandable.open:hover td:first-child{box-shadow:inset 4px 0 0 var(--acc2)}
 
 tr.detail-row>td{background:#0a0e14;border-top:1px solid var(--line);
   border-bottom:2px solid var(--acc2);padding:18px 22px;cursor:default}
-tr.detail-row .kv{display:grid;grid-template-columns:180px 1fr;gap:4px 12px;font-size:12px}
-tr.detail-row .kv b{color:var(--dim);font-weight:400}
+
+/* ── .kv: ГЛОБАЛЬНЫЙ, работает и в таблице, и в #ipResult ── */
+.kv{display:grid;grid-template-columns:180px 1fr;gap:4px 12px;font-size:12px}
+.kv b{color:var(--dim);font-weight:400}
+.kv > *{min-width:0}
+
+#ipResult .kv{margin-top:4px}
+#ipResult .sec-title{margin-top:14px}
+#ipResult details.raw{margin-top:10px}
 
 .sec-title{color:var(--acc2);letter-spacing:2px;margin:14px 0 8px;font-size:11px;
   border-bottom:1px solid var(--line);padding-bottom:5px;
@@ -88,3 +99,12 @@ pre.json .j-punc{color:var(--j-punc)}
 .modal h3::before{content:'';width:4px;height:14px;background:var(--acc)}
 .modal label{display:block;color:var(--dim);font-size:11px;margin:12px 0 4px;letter-spacing:1px}
 .modal .actions{display:flex;gap:8px;margin-top:18px;justify-content:flex-end}
+
+.srv-img{width:40px;height:40px;object-fit:cover;image-rendering:pixelated;
+  border:1px solid var(--line);background:#000;display:block}
+
+@keyframes rowflash {
+  0%   { background: rgba(111, 199, 154, .30); }
+  100% { background: transparent; }
+}
+tr.flash > td{animation: rowflash 1.5s ease-out}

@@ -6,13 +6,31 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"goPinger/query"
 )
+
+var redisClient *redis.Client
+
+func initRedis(ctx context.Context, url string) error {
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		return err
+	}
+	redisClient = redis.NewClient(opts)
+	c, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return redisClient.Ping(c).Err()
+}
 
 func keyType(address string) string  { return "gp:type:" + address }
 func keyState(address string) string { return "gp:state:" + address }
 func keyNext(id int64) string        { return "gp:next:" + strconv.FormatInt(id, 10) }
 func keyUser(token string) string    { return "gp:user:" + token }
+func keyLastPoll(addr string) string { return "gp:lastpoll:" + addr }
+func keyLock(addr string) string     { return "gp:lock:" + addr }
+func keyList(userID string) string   { return "gp:list:" + userID }
 
 func getCachedType(ctx context.Context, address string) (query.ServerType, bool) {
 	n, err := redisClient.Get(ctx, keyType(address)).Int()
@@ -61,8 +79,48 @@ func cachedUserToken(ctx context.Context, token string) (User, error) {
 	return u, nil
 }
 
-// Кеш последнего успешного состояния, разделяемый между всеми пользователями,
-// которые добавили один и тот же адрес. TTL ключа == интервалу опроса.
+// --- lastpoll & lock ---
+
+func getLastPoll(ctx context.Context, addr string) (time.Time, bool) {
+	ms, err := redisClient.Get(ctx, keyLastPoll(addr)).Int64()
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
+}
+
+func setLastPoll(ctx context.Context, addr string, t time.Time) {
+	redisClient.Set(ctx, keyLastPoll(addr), t.UnixMilli(), 24*time.Hour)
+}
+
+// acquireServerLock берёт глобальный lock на адрес и сразу проставляет lastpoll=now.
+func acquireServerLock(ctx context.Context, addr string) (func(), bool) {
+	ttl := cfg.QueryTimeout + 5*time.Second
+	ok, err := redisClient.SetNX(ctx, keyLock(addr), "1", ttl).Result()
+	if err != nil || !ok {
+		return nil, false
+	}
+	setLastPoll(ctx, addr, time.Now())
+	return func() { redisClient.Del(context.Background(), keyLock(addr)) }, true
+}
+
+func waitForCache(ctx context.Context, addr string) (*ServerState, bool) {
+	deadline := time.Now().Add(cfg.LockWaitTimeout)
+	for time.Now().Before(deadline) {
+		if st, _, ok := getStateCache(ctx, addr); ok {
+			return st, true
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return nil, false
+}
+
+// --- state cache ---
+
 func getStateCache(ctx context.Context, address string) (*ServerState, time.Duration, bool) {
 	b, err := redisClient.Get(ctx, keyState(address)).Bytes()
 	if err != nil {
@@ -89,48 +147,8 @@ func extendStateCache(ctx context.Context, address string, ttl time.Duration) {
 	redisClient.Expire(ctx, keyState(address), ttl)
 }
 
-func keyLastPoll(addr string) string { return "gp:lastpoll:" + addr }
-func keyLock(addr string) string     { return "gp:lock:" + addr }
+// --- list cache ---
 
-func getLastPoll(ctx context.Context, addr string) (time.Time, bool) {
-	ms, err := redisClient.Get(ctx, keyLastPoll(addr)).Int64()
-	if err != nil {
-		return time.Time{}, false
-	}
-	return time.UnixMilli(ms), true
-}
-
-func setLastPoll(ctx context.Context, addr string, t time.Time) {
-	redisClient.Set(ctx, keyLastPoll(addr), t.UnixMilli(), 24*time.Hour)
-}
-
-// acquireServerLock берёт глобальный lock на адрес. Пока lock жив, ни один
-// другой пользователь не может инициировать реальный запрос к этому адресу.
-// При успехе сразу проставляет lastpoll = now, чтобы даже при падении
-// запроса не было искушения долбить сервер снова.
-func acquireServerLock(ctx context.Context, addr string) (func(), bool) {
-	ttl := cfg.QueryTimeout + 5*time.Second
-	ok, err := redisClient.SetNX(ctx, keyLock(addr), "1", ttl).Result()
-	if err != nil || !ok {
-		return nil, false
-	}
-	setLastPoll(ctx, addr, time.Now())
-	return func() { redisClient.Del(context.Background(), keyLock(addr)) }, true
-}
-
-// waitForCache ждёт появления кеша (например, пока другой пользователь
-// завершает реальный запрос) в течение cfg.LockWaitTimeout.
-func waitForCache(ctx context.Context, addr string) (*ServerState, bool) {
-	deadline := time.Now().Add(cfg.LockWaitTimeout)
-	for time.Now().Before(deadline) {
-		if st, _, ok := getStateCache(ctx, addr); ok {
-			return st, true
-		}
-		select {
-		case <-ctx.Done():
-			return nil, false
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-	return nil, false
+func invalidateListCache(ctx context.Context, userID string) {
+	redisClient.Del(ctx, keyList(userID))
 }

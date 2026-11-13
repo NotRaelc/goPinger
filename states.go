@@ -33,16 +33,15 @@ func stateErr(err error) ServerState {
 func saveState(ctx context.Context, serverID int64, st ServerState) error {
 	var payload any
 	if st.Payload != nil {
-		b, err := json.Marshal(st.Payload)
-		if err == nil {
+		if b, err := json.Marshal(st.Payload); err == nil {
 			payload = b
 		}
 	}
 	_, err := pool.Exec(ctx, `
 		INSERT INTO server_states(server_id, ok, error, payload, checked_at)
-		VALUES ($1, $2, $3, $4, $5)
+		VALUES ($1,$2,$3,$4,$5)
 		ON CONFLICT (server_id) DO UPDATE
-		SET ok = $2, error = $3, payload = $4, checked_at = $5
+		SET ok=$2, error=$3, payload=$4, checked_at=$5
 	`, serverID, st.OK, nullableString(st.Error), payload, time.UnixMilli(st.CheckedAt))
 	return err
 }

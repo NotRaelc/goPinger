@@ -21,11 +21,8 @@ func startPoller(ctx context.Context) {
 	}
 }
 
-// pollDue запускает обновление всех «созревших» серверов одновременно.
-// Ограничение — только sem (чтобы не спавнить 10k горутин на одном тике);
-// реальный rate-limit по адресу обеспечивает fetchState через Redis.
 func pollDue(ctx context.Context, sem chan struct{}) {
-	servers, err := listEnabledServers(ctx)
+	servers, err := enabledServersCached(ctx)
 	if err != nil {
 		slog.Error("list enabled servers", "err", err)
 		return
@@ -42,7 +39,7 @@ func pollDue(ctx context.Context, sem chan struct{}) {
 				pollServer(ctx, s)
 			}(s)
 		default:
-			// Семафор полон — остальные подхватит следующий тик через PollTick.
+			// семафор полон — остальное подхватит следующий тик
 		}
 	}
 }

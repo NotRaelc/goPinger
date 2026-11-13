@@ -11,9 +11,9 @@ const DEFAULT_IMG = "data:image/svg+xml;utf8," + encodeURIComponent(
 let servers = [];
 const expanded = new Set();
 const flashing = new Set();
+const pendingPolls = new Set();
 let editingId = null;
 
-// ---------- helpers ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtTime = ts => ts ? new Date(ts).toLocaleTimeString() : '—';
@@ -30,7 +30,6 @@ function relTime(ts) {
   return new Date(ts).toLocaleDateString();
 }
 
-// Раз в секунду обновляем только относительные метки — без перерисовки таблицы.
 setInterval(() => {
   document.querySelectorAll('[data-rel-time]').forEach(el => {
     el.textContent = relTime(parseInt(el.dataset.relTime, 10));
@@ -54,7 +53,6 @@ function imageUrl(s) {
 }
 window.onImgError = img => { img.onerror = null; img.src = DEFAULT_IMG; };
 
-// ---------- JSON highlight ----------
 function highlightJSON(obj) {
   let json;
   try { json = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
@@ -99,7 +97,7 @@ const COLUMNS = [
   { key:'ip',       label:'IP:PORT',  width:'170px',
     render:s=>{const p=s.state?.payload; if(!p) return '—'; return esc(p.ip||'')+(p.port?':'+p.port:'');} },
 
-  { key:'checked', label:'ОПРОС', width:'150px',
+  { key:'checked',  label:'ОПРОС',    width:'150px',
     render:s=>{
       const ts = s.state?.checked_at;
       if (!ts) return '—';
@@ -113,9 +111,12 @@ const COLUMNS = [
       return `<span data-rel-time="${ts}" title="${fmtTime(ts)}" style="color:${color}">${relTime(ts)}</span>${badge}`;
     } },
 
+  // Кнопка всегда рендерится как "ОПРОС" без disabled —
+  // pending-состояние накатывается через updateRowById (property sync,
+  // без пересоздания элемента → нет фликера).
   { key:'actions',  label:'ДЕЙСТВИЯ', width:'230px', always:true,
     render:s=>`<div class="actions">
-      <button class="ghost sm" onclick="pollId(${s.id},event)">ОПРОС</button>
+      <button class="ghost sm" data-poll-id="${s.id}" onclick="pollId(${s.id},event)">ОПРОС</button>
       <button class="ghost sm" onclick="editServer(${s.id},event)">ИЗМ</button>
       <button class="danger sm" onclick="delServer(${s.id},event)">✕</button>
     </div>` },
@@ -135,6 +136,26 @@ function loadCols(){
 function saveCols(){ localStorage.setItem(COLS_KEY, JSON.stringify([...visibleCols])); }
 const activeColumns = () => COLUMNS.filter(c => c.always || visibleCols.has(c.key));
 
+function filteredServers() {
+  const q = ($('search')?.value || '').toLowerCase().trim();
+  if (!q) return servers;
+  return servers.filter(s =>
+    s.address.toLowerCase().includes(q) ||
+    (s.label || '').toLowerCase().includes(q));
+}
+
+// ---------- rendering ----------
+function buildRowHTML(s, i, cols) {
+  return cols.map(c => `<td>${c.render(s, i) ?? ''}</td>`).join('');
+}
+
+function attachRowHandlers(tr, s) {
+  tr.addEventListener('click', ev => {
+    if (ev.target.closest('button,a,input,select')) return;
+    toggleExpand(s.id);
+  });
+}
+
 function renderTable(){
   const cols = activeColumns();
   $('thead').innerHTML = '<tr>' + cols.map(c =>
@@ -142,21 +163,24 @@ function renderTable(){
 
   const tbody = $('rows');
   tbody.innerHTML = '';
-  if (!servers.length) {
-    tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:var(--dim)">нет серверов — добавь первый</td></tr>`;
+
+  const visible = filteredServers();
+  if (!visible.length) {
+    const msg = servers.length ? 'нет совпадений' : 'нет серверов — добавь первый';
+    tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:var(--dim)">${msg}</td></tr>`;
     return;
   }
-  servers.forEach((s, i) => {
+
+  visible.forEach((s, i) => {
     const tr = document.createElement('tr');
+    tr.dataset.rowId = String(s.id);
     tr.className = 'expandable'
       + (expanded.has(s.id) ? ' open' : '')
       + (flashing.has(s.id) ? ' flash' : '');
-    tr.innerHTML = cols.map(c => `<td>${c.render(s, i) ?? ''}</td>`).join('');
-    tr.addEventListener('click', ev => {
-      if (ev.target.closest('button,a,input,select')) return;
-      toggleExpand(s.id);
-    });
+    tr.innerHTML = buildRowHTML(s, i, cols);
+    attachRowHandlers(tr, s);
     tbody.appendChild(tr);
+
     if (expanded.has(s.id)) {
       const dr = document.createElement('tr');
       dr.className = 'detail-row';
@@ -164,6 +188,72 @@ function renderTable(){
       tbody.appendChild(dr);
     }
   });
+
+  // Синхронизируем pending-состояние кнопок (для случая renderTable во время опроса)
+  servers.forEach(s => {
+    if (!pendingPolls.has(s.id)) return;
+    const btn = document.querySelector(`button[data-poll-id="${s.id}"]`);
+    if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  });
+}
+
+// Точечное обновление строки. Кнопку ОПРОС не пересоздаём — правим property.
+function updateRowById(id){
+  const s = servers.find(x => x.id === id);
+  if (!s) return;
+
+  const visible = filteredServers();
+  const i = visible.findIndex(x => x.id === id);
+  const tr = document.querySelector(`tr.expandable[data-row-id="${id}"]`);
+
+  if (i < 0) { if (tr) tr.remove(); return; }
+  if (!tr) { renderTable(); return; }
+
+  const cols = activeColumns();
+  const tds = tr.children;
+  const isPending = pendingPolls.has(id);
+
+  cols.forEach((c, idx) => {
+    const td = tds[idx];
+    if (!td) return;
+
+    // Actions cell: сохраняем идентичность кнопки, обновляем только state.
+    if (c.key === 'actions') {
+      const pollBtn = td.querySelector('button[data-poll-id]');
+      if (pollBtn) {
+        pollBtn.disabled = isPending;
+        pollBtn.textContent = isPending ? '…' : 'ОПРОС';
+        return;
+      }
+      td.innerHTML = c.render(s, i) ?? '';
+      return;
+    }
+
+    const newHTML = c.render(s, i) ?? '';
+    if (td.innerHTML !== newHTML) td.innerHTML = newHTML;
+  });
+
+  // flash/open классы
+  const isOpen = expanded.has(id);
+  const shouldFlash = flashing.has(id);
+  const want = 'expandable' + (isOpen ? ' open' : '') + (shouldFlash ? ' flash' : '');
+  if (tr.className !== want) tr.className = want;
+
+  // detail row
+  let dr = tr.nextElementSibling;
+  if (isOpen) {
+    const detailHTML = `<td colspan="${cols.length}">${renderDetail(s)}</td>`;
+    if (dr && dr.classList.contains('detail-row')) {
+      if (dr.innerHTML !== detailHTML) dr.innerHTML = detailHTML;
+    } else {
+      dr = document.createElement('tr');
+      dr.className = 'detail-row';
+      dr.innerHTML = detailHTML;
+      tr.after(dr);
+    }
+  } else if (dr && dr.classList.contains('detail-row')) {
+    dr.remove();
+  }
 }
 
 function renderDetail(s){
@@ -177,30 +267,36 @@ function renderDetail(s){
 function toggleExpand(id, ev){
   if (ev) ev.stopPropagation();
   if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
-  renderTable();
+  updateRowById(id);
 }
 
 function renderServerCard(p, { withRaw = false } = {}){
   if (!p) return '<i style="color:var(--dim)">пусто</i>';
+
+  const KV  = 'display:grid;grid-template-columns:180px 1fr;gap:4px 12px;font-size:12px';
+  const LBL = 'color:var(--dim);font-weight:400';
+
   const pl = p.players || [];
   const motdLines = (p.motd?.clean||[]).join(' / ') || (p.motd?.raw||[]).join(' / ') || '—';
   const versions  = (p.versions||[]).slice(0,8).join(', ') + ((p.versions||[]).length>8?'…':'');
-  let h = `<div class="kv">
-    <b>GameKind</b><span>${esc(p.game_kind||'—')}</span>
-    <b>Online</b><span style="color:${p.online?'var(--acc)':'var(--err)'}">${p.online?'YES':'NO'}</span>
-    <b>Name</b><span>${esc(p.name||'—')}</span>
-    <b>IP : Port</b><span>${esc(p.ip||'')}${p.port?':'+p.port:''}</span>
-    ${p.hostname?`<b>Hostname</b><span>${esc(p.hostname)}</span>`:''}
-    <b>Players</b><span>${p.online_players??'—'} / ${p.max_players??'—'}</span>
-    <b>MOTD</b><span>${esc(motdLines)}</span>
-    ${versions?`<b>Versions</b><span>${esc(versions)}</span>`:''}
-    ${p.protocol?`<b>Protocol</b><span>${p.protocol}</span>`:''}
-    ${p.software?`<b>Software</b><span>${esc(p.software)}</span>`:''}
-    ${p.gamemode?`<b>Gamemode</b><span>${esc(p.gamemode)}</span>`:''}
-    ${p.map?`<b>Map</b><span>${esc(p.map)}</span>`:''}
-    ${p.game_id>=0?`<b>Game ID</b><span>${p.game_id}</span>`:''}
-    ${p.serverid?`<b>ServerID</b><span>${esc(p.serverid)}</span>`:''}
+
+  let h = `<div class="kv" style="${KV}">
+    <b style="${LBL}">GameKind</b><span>${esc(p.game_kind||'—')}</span>
+    <b style="${LBL}">Online</b><span style="color:${p.online?'var(--acc)':'var(--err)'}">${p.online?'YES':'NO'}</span>
+    <b style="${LBL}">Name</b><span>${esc(p.name||'—')}</span>
+    <b style="${LBL}">IP : Port</b><span>${esc(p.ip||'')}${p.port?':'+p.port:''}</span>
+    ${p.hostname?`<b style="${LBL}">Hostname</b><span>${esc(p.hostname)}</span>`:''}
+    <b style="${LBL}">Players</b><span>${p.online_players??'—'} / ${p.max_players??'—'}</span>
+    <b style="${LBL}">MOTD</b><span>${esc(motdLines)}</span>
+    ${versions?`<b style="${LBL}">Versions</b><span>${esc(versions)}</span>`:''}
+    ${p.protocol?`<b style="${LBL}">Protocol</b><span>${p.protocol}</span>`:''}
+    ${p.software?`<b style="${LBL}">Software</b><span>${esc(p.software)}</span>`:''}
+    ${p.gamemode?`<b style="${LBL}">Gamemode</b><span>${esc(p.gamemode)}</span>`:''}
+    ${p.map?`<b style="${LBL}">Map</b><span>${esc(p.map)}</span>`:''}
+    ${p.game_id>=0?`<b style="${LBL}">Game ID</b><span>${p.game_id}</span>`:''}
+    ${p.serverid?`<b style="${LBL}">ServerID</b><span>${esc(p.serverid)}</span>`:''}
   </div>`;
+
   if (pl.length) {
     h += `<div class="sec-title">ИГРОКИ (${pl.length})</div>
       <div style="max-height:180px;overflow:auto;font-size:11px">
@@ -270,7 +366,7 @@ async function loadServers(){
   renderTable();
 }
 
-// ---------- SSE live updates ----------
+// ---------- SSE (batched states, dedup by checked_at) ----------
 let es = null;
 let sseRetryTimer = null;
 
@@ -284,15 +380,31 @@ function setLive(on){
 function connectEvents(){
   if (es) return;
   es = new EventSource('/api/events');
-  es.addEventListener('state', e => {
+  es.addEventListener('states', e => {
     setLive(true);
     try {
-      const dto = JSON.parse(e.data);
-      const i = servers.findIndex(x => x.id === dto.id);
-      if (i >= 0) servers[i] = dto; else servers.push(dto);
-      flashing.add(dto.id);
-      setTimeout(() => { flashing.delete(dto.id); renderTable(); }, 1600);
-      renderTable();
+      const dtos = JSON.parse(e.data);
+      for (const dto of dtos) {
+        const idx = servers.findIndex(x => x.id === dto.id);
+
+        // Дедуп: состояние пришло HTTP-ответом раньше SSE-батча — не мигаем.
+        if (idx >= 0 && servers[idx].state && dto.state &&
+            servers[idx].state.checked_at === dto.state.checked_at) {
+          servers[idx] = dto; // обновим icon_url и прочие поля без рендера
+          continue;
+        }
+
+        if (idx >= 0) servers[idx] = dto; else servers.push(dto);
+
+        if (pendingPolls.has(dto.id)) continue;
+
+        flashing.add(dto.id);
+        setTimeout(() => {
+          flashing.delete(dto.id);
+          updateRowById(dto.id);
+        }, 1600);
+        updateRowById(dto.id);
+      }
     } catch (err) { console.error('sse parse', err); }
   });
   es.onopen = () => setLive(true);
@@ -326,7 +438,12 @@ async function checkAddr(){
     box.innerHTML = `<span style="color:var(--err)">${esc(r.data.error)}</span>`;
     return;
   }
-  box.innerHTML = renderServerCard(r.data.payload, { withRaw: true });
+
+  const badge = r.data.from_cache
+    ? `<div style="margin-bottom:8px"><span class="pill" style="background:var(--warn);color:#1a1305;border-color:var(--warn);font-weight:700">CACHE</span>
+       <span style="color:var(--dim);font-size:11px;margin-left:8px">из кеша — реальный запрос был недавно</span></div>`
+    : '';
+  box.innerHTML = badge + renderServerCard(r.data.payload, { withRaw: true });
 }
 
 // ---------- CRUD ----------
@@ -366,11 +483,11 @@ async function saveServer(){
   closeModal('mAdd');
 
   if (!editingId && r.data) {
-    // create: r.data — готовый ServerDTO, включая state.from_cache
     servers.push(r.data);
-    flashing.add(r.data.id);
-    setTimeout(() => { flashing.delete(r.data.id); renderTable(); }, 1600);
     renderTable();
+    flashing.add(r.data.id);
+    updateRowById(r.data.id);
+    setTimeout(() => { flashing.delete(r.data.id); updateRowById(r.data.id); }, 1600);
   } else {
     await loadServers();
   }
@@ -382,32 +499,39 @@ async function delServer(id, ev){
   const r = await api(`/api/servers/${id}`, { method: 'DELETE' });
   if (!r.ok) return alert(r.data?.error || 'Ошибка удаления');
   expanded.delete(id);
+  pendingPolls.delete(id);
   await loadServers();
 }
 
 async function pollId(id, ev){
   if (ev) ev.stopPropagation();
+  if (pendingPolls.has(id)) return;
   const i = servers.findIndex(x => x.id === id);
   if (i < 0) return;
 
-  // Оптимистично показываем «опрос идёт», но не сбрасываем checked_at —
-  // если сервер ответит из кеша, старый timestamp останется правдой.
-  const prev = servers[i].state;
-  servers[i].state = { ...prev, ok: null };
-  renderTable();
+  pendingPolls.add(id);
+  updateRowById(id); // button → … через property sync
 
-  const r = await api(`/api/servers/${id}/poll`, { method: 'POST' });
-  if (r.ok && r.data) {
-    servers[i].state = r.data;
-    if (r.data.from_cache) {
-      // короткий тактильный сигнал — можно заменить на toast, если захочешь
-      flashing.add(id);
-      setTimeout(() => { flashing.delete(id); renderTable(); }, 800);
+  try {
+    const r = await api(`/api/servers/${id}/poll`, { method: 'POST' });
+    if (r.ok && r.data) {
+      servers[i].state = r.data;
+      if (r.data.from_cache) {
+        flashing.add(id);
+        setTimeout(() => { flashing.delete(id); updateRowById(id); }, 800);
+      }
     }
-  } else {
-    servers[i].state = prev;
+  } finally {
+    pendingPolls.delete(id);
+    updateRowById(id); // button → ОПРОС через property sync
   }
-  renderTable();
+}
+
+async function pollAll(){
+  if (!servers.length) return;
+  if (!confirm('Опрос всех серверов?')) return;
+  const r = await api('/api/servers/poll-all', { method: 'POST' });
+  if (!r.ok) alert(r.data?.error || 'Ошибка');
 }
 
 async function logout(){
@@ -420,4 +544,4 @@ async function logout(){
 loadMe();
 loadServers();
 connectEvents();
-setInterval(loadServers, 60_000); // fallback на случай разрыва SSE
+setInterval(loadServers, 60_000);

@@ -1,11 +1,15 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 	"uuid"
 )
@@ -52,14 +56,12 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// Проксируем Flush, иначе SSE (`w.(http.Flusher)`) ломается.
 func (r *statusRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
-// Unwrap делает http.ResponseController совместимым с обёрткой (Go 1.20+).
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 func LoggingMiddleware(next http.Handler) http.Handler {
@@ -118,7 +120,6 @@ func AuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Отдельный middleware для JSON API: не редиректит, а отдаёт 401.
 func APIAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie("token")
@@ -157,6 +158,79 @@ func NoCacheMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
 		next.ServeHTTP(w, r)
+	})
+}
+
+// ---------- Gzip ----------
+
+var gzipPool = sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
+
+type gzipWriter struct {
+	http.ResponseWriter
+	zw          *gzip.Writer
+	wroteHeader bool
+	skip        bool
+}
+
+// WriteHeader выставляет Content-Encoding ДО того, как заголовки уйдут клиенту.
+// Иначе браузер получит gzip-тело без заголовка и покажет мусор.
+func (g *gzipWriter) WriteHeader(code int) {
+	if g.wroteHeader {
+		return
+	}
+	g.wroteHeader = true
+
+	if code < 200 || code == http.StatusNoContent || code == http.StatusNotModified ||
+		(code >= 300 && code < 400) {
+		g.skip = true
+		g.ResponseWriter.WriteHeader(code)
+		return
+	}
+
+	h := g.ResponseWriter.Header()
+	h.Del("Content-Length")
+	h.Set("Content-Encoding", "gzip")
+	h.Set("Vary", "Accept-Encoding")
+	g.ResponseWriter.WriteHeader(code)
+}
+
+func (g *gzipWriter) Write(b []byte) (int, error) {
+	if !g.wroteHeader {
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.skip {
+		return g.ResponseWriter.Write(b)
+	}
+	return g.zw.Write(b)
+}
+
+func (g *gzipWriter) Flush() {
+	if !g.skip {
+		_ = g.zw.Flush()
+	}
+	if f, ok := g.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (g *gzipWriter) Unwrap() http.ResponseWriter { return g.ResponseWriter }
+
+func GzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") ||
+			strings.HasPrefix(r.URL.Path, "/api/events") ||
+			strings.HasPrefix(r.URL.Path, "/static/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		zw := gzipPool.Get().(*gzip.Writer)
+		zw.Reset(w)
+		gw := &gzipWriter{ResponseWriter: w, zw: zw}
+		next.ServeHTTP(gw, r)
+		if !gw.skip {
+			_ = zw.Close()
+		}
+		gzipPool.Put(zw)
 	})
 }
 

@@ -12,7 +12,6 @@
 
 <header>
   <div class="logo">[ goPinger ]</div>
-  <span class="live" id="live">○ OFFLINE</span>
   <div>
     <span class="live" id="live">○ OFFLINE</span>
     <span class="who" id="who"></span>
@@ -41,13 +40,15 @@
   <div class="toolbar">
     <div class="left">
       <div class="sec-h"><span class="bar"></span><span class="txt">МОИ СЕРВЕРЫ</span></div>
-      <span class="hint">клик по строке — <b>развернуть</b> / <b>свернуть</b> детали</span>
+      <input id="search" class="search-input" placeholder="поиск по адресу / метке"
+             oninput="renderTable()">
     </div>
     <div class="right">
       <div class="colpicker">
         <button class="ghost" onclick="toggleColPicker(event)">⚙ КОЛОНКИ</button>
         <div class="colpicker-menu" id="colPickerMenu"></div>
       </div>
+      <button class="ghost" onclick="pollAll()">⚡ ВСЕ</button>
       <button class="ghost" onclick="loadServers()">↻ ОБНОВИТЬ</button>
       <button onclick="openAdd()">+ ДОБАВИТЬ</button>
     </div>
@@ -72,7 +73,7 @@
       <option value="1">SOURCE (A2S)</option>
     </select>
     <label>ИНТЕРВАЛ ОПРОСА (сек, 0 = авто по типу)</label>
-	<input id="fInterval" type="number" min="0" value="0">
+    <input id="fInterval" type="number" min="0" value="0">
     <label>МЕТКА (необязательно)</label>
     <input id="fLabel" placeholder="prod / dev / любимый сервер">
     <div class="actions">

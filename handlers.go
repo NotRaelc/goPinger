@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"goPinger/query"
@@ -23,7 +25,9 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 
 func currentUser(r *http.Request) User { return r.Context().Value(userKey).(User) }
 
-func decodeJSON(r *http.Request, v any) bool {
+// decodeJSON с жёстким лимитом 64 KB на тело запроса.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	return json.NewDecoder(r.Body).Decode(v) == nil
 }
 
@@ -50,11 +54,46 @@ func serveHTML(w http.ResponseWriter, r *http.Request, path string) {
 func authPage(w http.ResponseWriter, r *http.Request) { serveHTML(w, r, "frontend/auth.html") }
 func mainPage(w http.ResponseWriter, r *http.Request) { serveHTML(w, r, "frontend/app.html") }
 
-// ------- auth (HTML flow) -------
+// --- cookies ---
+
+func deleteCookieToken(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: "token", Value: "", Path: "/",
+		MaxAge: -1, HttpOnly: true, Expires: time.Unix(0, 0),
+	})
+}
+
+func setCookieToken(w http.ResponseWriter, tokenValue string) {
+	http.SetCookie(w, &http.Cookie{
+		Name: "token", Value: tokenValue, Path: "/",
+		MaxAge:   400 * 24 * 60 * 60,
+		HttpOnly: true,
+		Expires:  time.Now().Add(400 * 24 * time.Hour),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// --- health ---
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	dbOK := pool.Ping(ctx) == nil
+	redisOK := redisClient.Ping(ctx).Err() == nil
+
+	status := http.StatusOK
+	if !dbOK || !redisOK {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, map[string]bool{"db": dbOK, "redis": redisOK})
+}
+
+// --- auth ---
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	var u LoginUser
-	if !decodeJSON(r, &u) || validate.Struct(u) != nil {
+	if !decodeJSON(w, r, &u) || validate.Struct(u) != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -76,7 +115,7 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	var u RegisterUser
-	if !decodeJSON(r, &u) || validate.Struct(u) != nil {
+	if !decodeJSON(w, r, &u) || validate.Struct(u) != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -87,7 +126,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/app", http.StatusSeeOther)
 }
 
-// ------- API -------
+// --- API ---
 
 func apiMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"username": currentUser(r).Username})
@@ -99,7 +138,7 @@ func apiListServers(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 400, err.Error())
 		return
 	}
-	list, err := listServers(r.Context(), user.Username)
+	list, err := listServersCached(r.Context(), user.Username)
 	if err != nil {
 		writeJSONError(w, 500, err.Error())
 		return
@@ -156,7 +195,7 @@ func apiCreateServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in serverInput
-	if !decodeJSON(r, &in) {
+	if !decodeJSON(w, r, &in) {
 		writeJSONError(w, 400, "invalid json")
 		return
 	}
@@ -188,7 +227,7 @@ func apiUpdateServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in serverInput
-	if !decodeJSON(r, &in) {
+	if !decodeJSON(w, r, &in) {
 		writeJSONError(w, 400, "invalid json")
 		return
 	}
@@ -244,6 +283,39 @@ func apiPollServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, state)
 }
 
+func apiPollAll(w http.ResponseWriter, r *http.Request) {
+	user := currentUser(r)
+	list, err := listServers(r.Context(), user.Username)
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+
+	sem := make(chan struct{}, 5)
+	var wg sync.WaitGroup
+	for _, dto := range list {
+		dto := dto
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			s := Server{
+				ID: dto.ID, UserID: user.Username, Address: dto.Address,
+				Type: dto.Type, IntervalSec: dto.IntervalSec,
+				Label: dto.Label, Enabled: dto.Enabled,
+			}
+			state, detected, _ := fetchState(r.Context(), s.Address, queryTypeFromInt(s.Type))
+			_ = saveState(r.Context(), s.ID, state)
+			markPolled(r.Context(), s.ID, intervalFor(detected))
+			publishState(user.Username, s, state)
+		}()
+	}
+	wg.Wait()
+	writeJSON(w, 200, map[string]int{"count": len(list)})
+}
+
 type queryInput struct {
 	Address string `json:"address"`
 	Type    int    `json:"type"`
@@ -251,7 +323,7 @@ type queryInput struct {
 
 func apiQuery(w http.ResponseWriter, r *http.Request) {
 	var in queryInput
-	if !decodeJSON(r, &in) {
+	if !decodeJSON(w, r, &in) {
 		writeJSONError(w, 400, "invalid json")
 		return
 	}
@@ -274,15 +346,19 @@ func apiEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 500, "streaming unsupported")
 		return
 	}
+	ch, err := subscribe(user.Username)
+	if err != nil {
+		writeJSONError(w, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	defer unsubscribe(user.Username, ch)
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
-
-	ch := subscribe(user.Username)
-	defer unsubscribe(user.Username, ch)
 
 	hb := time.NewTicker(20 * time.Second)
 	defer hb.Stop()
@@ -292,7 +368,7 @@ func apiEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case ev := <-ch:
-			fmt.Fprintf(w, "event: state\ndata: %s\n\n", ev)
+			fmt.Fprintf(w, "event: states\ndata: %s\n\n", ev)
 			flusher.Flush()
 		case <-hb.C:
 			fmt.Fprint(w, ": ping\n\n")
@@ -301,23 +377,29 @@ func apiEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ------- routes -------
+// --- routes ---
 
 func Routes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /healthz", healthHandler)
+
 	mux.Handle("GET /auth", Chain(http.HandlerFunc(authPage), NoCacheMiddleware, SuccessRedirectMiddleware))
 	mux.HandleFunc("POST /logout", logoutHandler)
-	mux.HandleFunc("POST /register", registerHandler)
-	mux.HandleFunc("POST /login", loginHandler)
+	mux.HandleFunc("POST /register", rateLimitAuth(registerHandler))
+	mux.HandleFunc("POST /login", rateLimitAuth(loginHandler))
 
 	mux.Handle("GET /app", Chain(http.HandlerFunc(mainPage), NoCacheMiddleware, AuthMiddleware))
 
 	mux.Handle("GET /api/me", Chain(http.HandlerFunc(apiMe), APIAuthMiddleware))
-	mux.Handle("GET /api/servers", Chain(http.HandlerFunc(apiListServers), APIAuthMiddleware))
+	mux.Handle("GET /api/servers", Chain(http.HandlerFunc(apiListServers),
+		APIAuthMiddleware, rateLimitUser(5, time.Second)))
 	mux.Handle("POST /api/servers", Chain(http.HandlerFunc(apiCreateServer), APIAuthMiddleware))
 	mux.Handle("PATCH /api/servers/{id}", Chain(http.HandlerFunc(apiUpdateServer), APIAuthMiddleware))
 	mux.Handle("DELETE /api/servers/{id}", Chain(http.HandlerFunc(apiDeleteServer), APIAuthMiddleware))
 	mux.Handle("POST /api/servers/{id}/poll", Chain(http.HandlerFunc(apiPollServer), APIAuthMiddleware))
-	mux.Handle("POST /api/query", Chain(http.HandlerFunc(apiQuery), APIAuthMiddleware))
+	mux.Handle("POST /api/servers/poll-all", Chain(http.HandlerFunc(apiPollAll),
+		APIAuthMiddleware, rateLimitUser(1, 5*time.Second)))
+	mux.Handle("POST /api/query", Chain(http.HandlerFunc(apiQuery),
+		APIAuthMiddleware, rateLimitUser(3, time.Second)))
 	mux.Handle("GET /api/events", Chain(http.HandlerFunc(apiEvents), APIAuthMiddleware))
 
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./frontend/static"))))
