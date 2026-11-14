@@ -1,10 +1,17 @@
-#login{display:flex;align-items:center;justify-content:center;min-height:100vh}
+#login{display:flex;align-items:center;justify-content:center;min-height:100vh;
+  padding:20px}
 #login .box{background:var(--panel);border:2px solid var(--line);padding:28px;width:380px;
-  box-shadow:0 0 0 1px var(--line-soft), 0 12px 40px rgba(0,0,0,.5)}
-#login h1{color:var(--acc);letter-spacing:4px;margin-bottom:20px;font-size:16px}
-#login .tabs{display:flex;gap:0;margin-bottom:16px;border:2px solid var(--line)}
-#login .tabs button{flex:1;height:36px;border:0;background:transparent;color:var(--dim);letter-spacing:2px}
-#login .tabs button.on{background:var(--acc);color:var(--ink)}
+  box-shadow:0 0 0 1px var(--line-soft), 0 12px 40px rgba(0,0,0,.5),
+             0 0 60px rgba(111,199,154,.05);
+  animation: fade-in .25s ease-out}
+#login h1{color:var(--acc);letter-spacing:4px;margin-bottom:20px;font-size:16px;
+  text-shadow:0 0 20px rgba(111,199,154,.4)}
+#login .tabs{display:flex;margin-bottom:16px;border:2px solid var(--line)}
+#login .tabs button{flex:1;height:36px;border:0;background:transparent;color:var(--dim);
+  letter-spacing:2px;transition:background-color .15s ease, color .15s ease}
+#login .tabs button:hover:not(.on){color:var(--fg);background:var(--panel2)}
+#login .tabs button.on{background:var(--acc);color:var(--ink);font-weight:700}
 #login input{margin-bottom:10px;height:36px}
 #login form button[type=submit]{width:100%;margin-top:6px;height:36px}
-#login .err{color:var(--err);margin-top:10px;min-height:16px}
+#login .err{color:var(--err);margin-top:10px;min-height:16px;font-size:12px}
+#login .err:not(:empty)::before{content:'⚠ ';margin-right:4px}

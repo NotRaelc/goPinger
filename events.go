@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"sync"
 	"time"
 )
@@ -12,11 +12,17 @@ const (
 	batchDelay     = 200 * time.Millisecond
 )
 
+var (
+	ErrSSELimit   = errors.New("sse: global capacity exhausted")
+	ErrSSEUserMax = errors.New("sse: too many connections for user")
+)
+
 type eventHub struct {
 	mu      sync.Mutex
 	subs    map[string]map[chan []byte]struct{}
 	pending map[string][]ServerDTO
 	timers  map[string]*time.Timer
+	total   int
 }
 
 var hub = &eventHub{
@@ -28,9 +34,12 @@ var hub = &eventHub{
 func subscribe(userID string) (chan []byte, error) {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
+	if hub.total >= cfg.SSEMaxConnections {
+		return nil, ErrSSELimit
+	}
 	set := hub.subs[userID]
 	if len(set) >= maxSubsPerUser {
-		return nil, fmt.Errorf("too many SSE connections")
+		return nil, ErrSSEUserMax
 	}
 	ch := make(chan []byte, 64)
 	if set == nil {
@@ -38,6 +47,7 @@ func subscribe(userID string) (chan []byte, error) {
 		hub.subs[userID] = set
 	}
 	set[ch] = struct{}{}
+	hub.total++
 	return ch, nil
 }
 
@@ -45,16 +55,17 @@ func unsubscribe(userID string, ch chan []byte) {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 	if set, ok := hub.subs[userID]; ok {
-		delete(set, ch)
+		if _, exists := set[ch]; exists {
+			delete(set, ch)
+			hub.total--
+		}
 		if len(set) == 0 {
 			delete(hub.subs, userID)
 		}
 	}
 }
 
-// publishState собирает обновления в буфер и раз в 200мс отправляет одним
-// фреймом всем подписчикам пользователя. При N серверах раз в тик —
-// экономим N-1 фреймов и N-1 renderTable на клиенте.
+// publishState буферизует обновления и шлёт одним SSE-фреймом раз в 200мс.
 func publishState(userID string, s Server, st ServerState) {
 	dto := buildDTO(s, &st)
 	hub.mu.Lock()

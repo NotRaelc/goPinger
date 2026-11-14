@@ -7,10 +7,16 @@ import (
 	"goPinger/query/mcutil/formatting"
 	"goPinger/query/mcutil/response"
 
+	"regexp"
+
 	"github.com/woozymasta/a2s/pkg/a2s"
 	"github.com/woozymasta/a2s/pkg/appid"
 	"github.com/woozymasta/a2s/pkg/keywords"
 )
+
+var faviconRe = regexp.MustCompile(`^data:image/(png|jpeg|gif|webp|x-icon);base64,[A-Za-z0-9+/]+=*$`)
+
+const maxFaviconBytes = 256 * 1024 // 256 KB
 
 func derefOr[T any](p *T, def T) T {
 	if p == nil {
@@ -80,7 +86,9 @@ func serverFromModern(resp *response.StatusModern, opts Options) Server {
 	s.Name = resp.Version.Name.Clean
 	s.Protocol = resp.Version.Protocol
 	if !opts.NoIcon && resp.Favicon != nil {
-		s.Icon = *resp.Favicon
+		if len(*resp.Favicon) <= maxFaviconBytes && faviconRe.MatchString(*resp.Favicon) {
+			s.Icon = *resp.Favicon
+		}
 	}
 	s.OnlinePlayers = derefOr(resp.Players.Online, 0)
 	s.MaxPlayers = derefOr(resp.Players.Max, 0)

@@ -11,59 +11,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-playground/validator/v10"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 
 	"goPinger/query"
 )
 
-var (
-	pool     *pgxpool.Pool
-	validate *validator.Validate
-)
-
-type RegisterUser struct {
-	Username        string `json:"username" validate:"required,min=1,max=32,alphanum"`
-	Password        string `json:"password" validate:"required,min=1,max=128,printascii"`
-	PasswordConfirm string `json:"password_confirm" validate:"required,eqfield=Password"`
-}
-
-type LoginUser struct {
-	Username string `json:"username" validate:"required,min=1,max=32,alphanum"`
-	Password string `json:"password" validate:"required,min=1,max=128,printascii"`
-}
-
-type User struct {
-	Username string `json:"username" validate:"required,min=1,max=32,alphanum"`
-	Hash     string `json:"password" validate:"required,min=1"`
-	Token    string `json:"token" validate:"required,min=1"`
-}
-
-type Server struct {
-	ID          int64
-	UserID      string
-	Address     string
-	Type        int
-	IntervalSec int
-	Label       string
-	Enabled     bool
-}
-
-type ServerDTO struct {
-	ID                   int64        `json:"id"`
-	Address              string       `json:"address"`
-	Type                 int          `json:"type"`
-	IntervalSec          int          `json:"interval_sec"`
-	EffectiveIntervalSec int          `json:"effective_interval_sec"`
-	Label                string       `json:"label"`
-	Enabled              bool         `json:"enabled"`
-	IconURL              string       `json:"icon_url,omitempty"`
-	State                *ServerState `json:"state,omitempty"`
-}
-
-// --- кеш списка серверов для поллера ---
+// ---------- кеш списка серверов для поллера ----------
 
 var (
 	serversCacheMu  sync.RWMutex
@@ -90,7 +45,6 @@ func enabledServersCached(ctx context.Context) ([]Server, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	serversCacheMu.Lock()
 	serversCache = list
 	serversCacheExp = time.Now().Add(30 * time.Second)
@@ -98,7 +52,7 @@ func enabledServersCached(ctx context.Context) ([]Server, error) {
 	return list, nil
 }
 
-// --- иконки Source-серверов ---
+// ---------- иконки Source-серверов ----------
 
 var (
 	iconFilesMu sync.RWMutex
@@ -116,25 +70,23 @@ func loadIconFiles() {
 		if e.IsDir() {
 			continue
 		}
-		name := strings.TrimSuffix(e.Name(), ".png")
-		if id, err := strconv.ParseInt(name, 10, 64); err == nil {
+		if id, err := strconv.ParseInt(strings.TrimSuffix(e.Name(), ".png"), 10, 64); err == nil {
 			iconFiles[id] = true
 		}
 	}
 }
 
-func iconExists(gameID int64) bool {
+func iconExists(id int64) bool {
 	iconFilesMu.RLock()
-	has, known := iconFiles[gameID]
+	has, known := iconFiles[id]
 	iconFilesMu.RUnlock()
 	if known {
 		return has
 	}
-	path := fmt.Sprintf("frontend/static/images/games/%d.png", gameID)
-	_, err := os.Stat(path)
+	_, err := os.Stat(fmt.Sprintf("frontend/static/images/games/%d.png", id))
 	exists := err == nil
 	iconFilesMu.Lock()
-	iconFiles[gameID] = exists
+	iconFiles[id] = exists
 	iconFilesMu.Unlock()
 	return exists
 }
@@ -153,12 +105,22 @@ func resolveIconURL(p *query.Server) string {
 }
 
 func buildDTO(s Server, st *ServerState) ServerDTO {
+	detected := query.ServerAuto
+	if st.Payload != nil {
+		detected = gameKindToType(st.Payload.GameKind)
+	}
+	interval := effectiveInterval(s, detected)
+	var nextAt int64
+	if s.Enabled {
+		nextAt = time.Now().Add(interval).UnixMilli()
+	}
 	return ServerDTO{
 		ID:                   s.ID,
 		Address:              s.Address,
 		Type:                 s.Type,
 		IntervalSec:          s.IntervalSec,
-		EffectiveIntervalSec: int(intervalFor(queryTypeFromInt(s.Type)).Seconds()),
+		EffectiveIntervalSec: int(interval.Seconds()),
+		NextPollAt:           nextAt,
 		Label:                s.Label,
 		Enabled:              s.Enabled,
 		IconURL:              resolveIconURL(st.Payload),
@@ -166,7 +128,7 @@ func buildDTO(s Server, st *ServerState) ServerDTO {
 	}
 }
 
-// --- singleflight-кеш для /api/servers ---
+// ---------- singleflight-кеш для /api/servers ----------
 
 var listSF singleflight.Group
 
@@ -194,7 +156,7 @@ func listServersCached(ctx context.Context, userID string) ([]ServerDTO, error) 
 	return v.([]ServerDTO), nil
 }
 
-// --- CRUD ---
+// ---------- CRUD ----------
 
 func listServers(ctx context.Context, userID string) ([]ServerDTO, error) {
 	rows, err := pool.Query(ctx, `
@@ -223,7 +185,7 @@ func listServers(ctx context.Context, userID string) ([]ServerDTO, error) {
 			&dto.Label, &dto.Enabled, &ok, &errStr, &payload, &checkedAt); err != nil {
 			return nil, err
 		}
-		dto.EffectiveIntervalSec = int(intervalFor(queryTypeFromInt(dto.Type)).Seconds())
+		var detected query.ServerType = query.ServerAuto
 		if ok != nil && checkedAt != nil {
 			dto.State = &ServerState{OK: *ok, CheckedAt: checkedAt.UnixMilli()}
 			if errStr != nil {
@@ -234,12 +196,40 @@ func listServers(ctx context.Context, userID string) ([]ServerDTO, error) {
 				if uerr := srv.Unmarshal(payload); uerr == nil {
 					dto.State.Payload = srv.Ptr()
 					dto.IconURL = resolveIconURL(dto.State.Payload)
+					if dto.State.Payload != nil {
+						detected = gameKindToType(dto.State.Payload.GameKind)
+					}
 				}
 			}
 		}
+		dto.EffectiveIntervalSec = int(effectiveInterval(
+			Server{Type: dto.Type, IntervalSec: dto.IntervalSec}, detected,
+		).Seconds())
 		out = append(out, dto)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Точный next_poll_at = now + TTL(keyNext) из Redis (совпадает с поллером).
+	if len(out) > 0 {
+		pipe := redisClient.Pipeline()
+		cmds := make([]*redis.DurationCmd, len(out))
+		for i := range out {
+			cmds[i] = pipe.TTL(ctx, keyNext(out[i].ID))
+		}
+		_, _ = pipe.Exec(ctx)
+		now := time.Now().UnixMilli()
+		for i := range out {
+			if !out[i].Enabled {
+				continue
+			}
+			if ttl, err := cmds[i].Result(); err == nil && ttl > 0 {
+				out[i].NextPollAt = now + ttl.Milliseconds()
+			}
+		}
+	}
+	return out, nil
 }
 
 func listEnabledServers(ctx context.Context) ([]Server, error) {
@@ -255,7 +245,8 @@ func listEnabledServers(ctx context.Context) ([]Server, error) {
 	var out []Server
 	for rows.Next() {
 		var s Server
-		if err := rows.Scan(&s.ID, &s.UserID, &s.Address, &s.Type, &s.IntervalSec, &s.Label, &s.Enabled); err != nil {
+		if err := rows.Scan(&s.ID, &s.UserID, &s.Address, &s.Type,
+			&s.IntervalSec, &s.Label, &s.Enabled); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -268,7 +259,8 @@ func getServerByID(ctx context.Context, id int64) (Server, error) {
 	err := pool.QueryRow(ctx, `
 		SELECT id, user_id, address, type, interval_sec, label, enabled
 		FROM servers WHERE id = $1
-	`, id).Scan(&s.ID, &s.UserID, &s.Address, &s.Type, &s.IntervalSec, &s.Label, &s.Enabled)
+	`, id).Scan(&s.ID, &s.UserID, &s.Address, &s.Type,
+		&s.IntervalSec, &s.Label, &s.Enabled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return s, ErrNotFound
 	}
@@ -279,9 +271,8 @@ func insertServer(ctx context.Context, s *Server) error {
 	err := pool.QueryRow(ctx, `
 		INSERT INTO servers(user_id, address, type, interval_sec, label, enabled)
 		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, created_at, updated_at
-	`, s.UserID, s.Address, s.Type, s.IntervalSec, s.Label, s.Enabled).
-		Scan(&s.ID, new(time.Time), new(time.Time))
+		RETURNING id
+	`, s.UserID, s.Address, s.Type, s.IntervalSec, s.Label, s.Enabled).Scan(&s.ID)
 	if err == nil {
 		invalidateServersCache()
 		invalidateListCache(ctx, s.UserID)
@@ -292,8 +283,8 @@ func insertServer(ctx context.Context, s *Server) error {
 func updateServer(ctx context.Context, s Server) error {
 	_, err := pool.Exec(ctx, `
 		UPDATE servers
-		SET address = $1, type = $2, interval_sec = $3, label = $4, enabled = $5, updated_at = NOW()
-		WHERE id = $6 AND user_id = $7
+		SET address=$1, type=$2, interval_sec=$3, label=$4, enabled=$5, updated_at=NOW()
+		WHERE id=$6 AND user_id=$7
 	`, s.Address, s.Type, s.IntervalSec, s.Label, s.Enabled, s.ID, s.UserID)
 	if err == nil {
 		invalidateServersCache()
@@ -303,7 +294,7 @@ func updateServer(ctx context.Context, s Server) error {
 }
 
 func deleteServer(ctx context.Context, userID string, id int64) error {
-	_, err := pool.Exec(ctx, `DELETE FROM servers WHERE id = $1 AND user_id = $2`, id, userID)
+	_, err := pool.Exec(ctx, `DELETE FROM servers WHERE id=$1 AND user_id=$2`, id, userID)
 	if err == nil {
 		invalidateServersCache()
 		invalidateListCache(ctx, userID)

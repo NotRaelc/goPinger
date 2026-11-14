@@ -27,7 +27,7 @@ async function submitAuth(event) {
 
   if (!username || !password) return showError('Заполните оба поля');
   if (authMode === 'register') {
-    if (password.length < 6)          return showError('Пароль должен быть не короче 6 символов');
+    if (password.length < 8)          return showError('Пароль должен быть не короче 8 символов');
     if (password !== passwordConfirm) return showError('Пароли не совпадают');
   }
 
@@ -51,11 +51,13 @@ async function submitAuth(event) {
     }
     if (authMode === 'login') {
       if      (r.status === 401) showError('Неверный логин или пароль');
+      else if (r.status === 429) showError('Слишком много попыток. Подождите минуту.');
       else if (r.status === 400) showError('Некорректные данные');
       else                       showError('Ошибка входа (' + r.status + ')');
     } else {
       if      (r.status === 409) showError('Пользователь уже существует');
-      else if (r.status === 400) showError('Некорректные данные');
+      else if (r.status === 429) showError('Слишком много попыток. Подождите минуту.');
+      else if (r.status === 400) showError('Некорректные данные (пароль ≥8 символов)');
       else                       showError('Ошибка регистрации (' + r.status + ')');
     }
   } catch {

@@ -24,24 +24,23 @@ func initRedis(ctx context.Context, url string) error {
 	return redisClient.Ping(c).Err()
 }
 
-func keyType(address string) string  { return "gp:type:" + address }
-func keyState(address string) string { return "gp:state:" + address }
-func keyNext(id int64) string        { return "gp:next:" + strconv.FormatInt(id, 10) }
-func keyUser(token string) string    { return "gp:user:" + token }
-func keyLastPoll(addr string) string { return "gp:lastpoll:" + addr }
-func keyLock(addr string) string     { return "gp:lock:" + addr }
-func keyList(userID string) string   { return "gp:list:" + userID }
+func keyType(a string) string  { return "gp:type:" + a }
+func keyState(a string) string { return "gp:state:" + a }
+func keyLock(a string) string  { return "gp:lock:" + a }
+func keyNext(id int64) string  { return "gp:next:" + strconv.FormatInt(id, 10) }
+func keyUser(t string) string  { return "gp:user:" + t }
+func keyList(u string) string  { return "gp:list:" + u }
 
-func getCachedType(ctx context.Context, address string) (query.ServerType, bool) {
-	n, err := redisClient.Get(ctx, keyType(address)).Int()
+func getCachedType(ctx context.Context, a string) (query.ServerType, bool) {
+	n, err := redisClient.Get(ctx, keyType(a)).Int()
 	if err != nil {
 		return query.ServerAuto, false
 	}
 	return query.ServerType(n), true
 }
 
-func cacheType(ctx context.Context, address string, t query.ServerType) {
-	redisClient.Set(ctx, keyType(address), int(t), 0)
+func cacheType(ctx context.Context, a string, t query.ServerType) {
+	redisClient.Set(ctx, keyType(a), int(t), 0)
 }
 
 func isDue(ctx context.Context, id int64) bool {
@@ -54,8 +53,18 @@ func acquirePoll(ctx context.Context, id int64) bool {
 	return err == nil && ok
 }
 
-func markPolled(ctx context.Context, id int64, interval time.Duration) {
-	redisClient.Set(ctx, keyNext(id), 1, interval)
+func markPolled(ctx context.Context, id int64, d time.Duration) {
+	redisClient.Set(ctx, keyNext(id), 1, d)
+}
+
+// remainingPoll — сколько осталось до следующего опроса сервера id.
+// -1 если опрос не запланирован (disabled или только что создан).
+func remainingPoll(ctx context.Context, id int64) time.Duration {
+	ttl, err := redisClient.TTL(ctx, keyNext(id)).Result()
+	if err != nil || ttl <= 0 {
+		return -1
+	}
+	return ttl
 }
 
 func clearUserCache(ctx context.Context, token string) {
@@ -79,36 +88,30 @@ func cachedUserToken(ctx context.Context, token string) (User, error) {
 	return u, nil
 }
 
-// --- lastpoll & lock ---
-
-func getLastPoll(ctx context.Context, addr string) (time.Time, bool) {
-	ms, err := redisClient.Get(ctx, keyLastPoll(addr)).Int64()
-	if err != nil {
-		return time.Time{}, false
-	}
-	return time.UnixMilli(ms), true
-}
-
-func setLastPoll(ctx context.Context, addr string, t time.Time) {
-	redisClient.Set(ctx, keyLastPoll(addr), t.UnixMilli(), 24*time.Hour)
-}
-
-// acquireServerLock берёт глобальный lock на адрес и сразу проставляет lastpoll=now.
-func acquireServerLock(ctx context.Context, addr string) (func(), bool) {
+// acquireServerLock — глобальный per-address lock. Проигравший не идёт в сеть.
+func acquireServerLock(ctx context.Context, a string) (func(), bool) {
 	ttl := cfg.QueryTimeout + 5*time.Second
-	ok, err := redisClient.SetNX(ctx, keyLock(addr), "1", ttl).Result()
+	ok, err := redisClient.SetNX(ctx, keyLock(a), "1", ttl).Result()
 	if err != nil || !ok {
 		return nil, false
 	}
-	setLastPoll(ctx, addr, time.Now())
-	return func() { redisClient.Del(context.Background(), keyLock(addr)) }, true
+	return func() { redisClient.Del(context.Background(), keyLock(a)) }, true
 }
 
-func waitForCache(ctx context.Context, addr string) (*ServerState, bool) {
+// waitForCache ждёт появления кеша, пока lock держится. Ранний выход,
+// если writer снял lock без сохранения (упал).
+func waitForCache(ctx context.Context, a string) (*ServerState, bool) {
 	deadline := time.Now().Add(cfg.LockWaitTimeout)
 	for time.Now().Before(deadline) {
-		if st, _, ok := getStateCache(ctx, addr); ok {
+		if st, _, ok := getStateCache(ctx, a); ok {
 			return st, true
+		}
+		if n, _ := redisClient.Exists(ctx, keyLock(a)).Result(); n == 0 {
+			time.Sleep(50 * time.Millisecond)
+			if st, _, ok := getStateCache(ctx, a); ok {
+				return st, true
+			}
+			return nil, false
 		}
 		select {
 		case <-ctx.Done():
@@ -119,10 +122,8 @@ func waitForCache(ctx context.Context, addr string) (*ServerState, bool) {
 	return nil, false
 }
 
-// --- state cache ---
-
-func getStateCache(ctx context.Context, address string) (*ServerState, time.Duration, bool) {
-	b, err := redisClient.Get(ctx, keyState(address)).Bytes()
+func getStateCache(ctx context.Context, a string) (*ServerState, time.Duration, bool) {
+	b, err := redisClient.Get(ctx, keyState(a)).Bytes()
 	if err != nil {
 		return nil, 0, false
 	}
@@ -130,24 +131,18 @@ func getStateCache(ctx context.Context, address string) (*ServerState, time.Dura
 	if json.Unmarshal(b, &st) != nil {
 		return nil, 0, false
 	}
-	ttl, err := redisClient.TTL(ctx, keyState(address)).Result()
+	ttl, err := redisClient.TTL(ctx, keyState(a)).Result()
 	if err != nil || ttl <= 0 {
 		return nil, 0, false
 	}
 	return &st, ttl, true
 }
 
-func saveStateCache(ctx context.Context, address string, st *ServerState, ttl time.Duration) {
+func saveStateCache(ctx context.Context, a string, st *ServerState, ttl time.Duration) {
 	if b, err := json.Marshal(st); err == nil {
-		redisClient.Set(ctx, keyState(address), b, ttl)
+		redisClient.Set(ctx, keyState(a), b, ttl)
 	}
 }
-
-func extendStateCache(ctx context.Context, address string, ttl time.Duration) {
-	redisClient.Expire(ctx, keyState(address), ttl)
-}
-
-// --- list cache ---
 
 func invalidateListCache(ctx context.Context, userID string) {
 	redisClient.Del(ctx, keyList(userID))

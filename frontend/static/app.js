@@ -12,27 +12,52 @@ let servers = [];
 const expanded = new Set();
 const flashing = new Set();
 const pendingPolls = new Set();
+const cooldowns = {};
 let editingId = null;
+let checkingAddr = false;
 
+// ---------- helpers ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmtTime = ts => ts ? new Date(ts).toLocaleTimeString() : '—';
+
+const fmtTime = ts => ts ? new Date(ts).toLocaleTimeString('ru-RU', { hour12: false }) : '—';
+const fmtDateTime = ts => ts ? new Date(ts).toLocaleString('ru-RU', { hour12: false }) : '—';
 const trunc = s => s == null || s === '' ? '—'
   : `<span class="cell-trunc" title="${esc(s)}">${esc(s)}</span>`;
 
-function relTime(ts) {
-  if (!ts) return '—';
-  const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (sec < 5) return 'только что';
-  if (sec < 60) return `${sec} сек назад`;
-  if (sec < 3600) return `${Math.floor(sec / 60)} мин назад`;
-  if (sec < 86400) return `${Math.floor(sec / 3600)} ч назад`;
-  return new Date(ts).toLocaleDateString();
+function fmtAgo(sec) {
+  if (sec < 0) sec = 0;
+  if (sec < 60) return `${sec}s назад`;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return s > 0 ? `${m}m ${s}s назад` : `${m}m назад`;
+  const h = Math.floor(m / 60), mm = m % 60;
+  if (h < 24) return mm > 0 ? `${h}h ${mm}m назад` : `${h}h назад`;
+  const d = Math.floor(h / 24), hh = h % 24;
+  return hh > 0 ? `${d}d ${hh}h назад` : `${d}d назад`;
 }
 
+function fmtCountdown(sec) {
+  if (sec <= 0) return '0s';
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  const h = Math.floor(m / 60), mm = m % 60;
+  if (h < 24) return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
+  const d = Math.floor(h / 24), hh = h % 24;
+  return hh > 0 ? `${d}d ${hh}h` : `${d}d`;
+}
+
+// Живой тикер: обновляет только текст таймеров, не структуру DOM.
 setInterval(() => {
-  document.querySelectorAll('[data-rel-time]').forEach(el => {
-    el.textContent = relTime(parseInt(el.dataset.relTime, 10));
+  const now = Date.now();
+  document.querySelectorAll('.live-timer').forEach(el => {
+    const ts = parseInt(el.dataset.ts, 10);
+    if (!ts) return;
+    if (el.dataset.mode === 'since') {
+      el.textContent = fmtAgo(Math.max(0, Math.floor((now - ts) / 1000)));
+    } else if (el.dataset.mode === 'until') {
+      el.textContent = fmtCountdown(Math.max(0, Math.ceil((ts - now) / 1000)));
+    }
   });
 }, 1000);
 
@@ -45,10 +70,36 @@ const playersCell = st => {
   return p && p.online_players != null ? `${p.online_players}/${p.max_players ?? 0}` : '—';
 };
 
+function lastPollCell(s) {
+  const ts = s.state?.checked_at;
+  if (!ts) return '—';
+  const ageSec = Math.floor((Date.now() - ts) / 1000);
+  const eff = s.effective_interval_sec || 60;
+  const stale = ageSec > eff * 1.5;
+  const color = stale ? 'var(--warn)' : 'var(--fg)';
+  const badge = s.state?.from_cache
+    ? ` <span class="cache-mark" title="данные из кеша — реального опроса не было">💾</span>`
+    : '';
+  return `<span class="live-timer" data-mode="since" data-ts="${ts}" style="color:${color}" title="${fmtDateTime(ts)}">${fmtAgo(ageSec)}</span>${badge}`;
+}
+
+function nextPollCell(s) {
+  const nextAt = s.next_poll_at;
+  if (!nextAt) return '—';
+  const remainingMs = nextAt - Date.now();
+  if (remainingMs <= 0) {
+    return `<span style="color:var(--warn);font-variant-numeric:tabular-nums">0s</span>`;
+  }
+  return `<span class="live-timer" data-mode="until" data-ts="${nextAt}"
+                style="color:var(--dim);font-variant-numeric:tabular-nums"
+                title="${fmtDateTime(nextAt)}">${fmtCountdown(Math.ceil(remainingMs / 1000))}</span>`;
+}
+
+const FAVICON_RE = /^data:image\/(png|jpeg|gif|webp|x-icon);base64,[A-Za-z0-9+/]+=*$/;
 function imageUrl(s) {
   const ic = s.state?.payload?.icon;
-  if (ic) return ic;
-  if (s.icon_url) return s.icon_url;
+  if (ic && FAVICON_RE.test(ic)) return ic;
+  if (s.icon_url && /^\/static\//.test(s.icon_url)) return s.icon_url;
   return DEFAULT_IMG;
 }
 window.onImgError = img => { img.onerror = null; img.src = DEFAULT_IMG; };
@@ -71,7 +122,7 @@ function highlightJSON(obj) {
 
 // ---------- columns ----------
 const COLUMNS = [
-  { key:'idx', label:'', width:'60px', always:true,
+  { key:'idx', label:'', width:'60px', always:true, pin:'start',
     render:(s,i)=>`<span class="chev">${expanded.has(s.id)?'▼':'▶'}</span><span class="rownum">${i+1}</span>` },
 
   { key:'image', label:'', width:'56px', always:true,
@@ -82,11 +133,14 @@ const COLUMNS = [
       + (s.label?` <span class="pill">${esc(s.label)}</span>`:'')
       + (s.enabled===false?` <span class="pill" style="color:var(--warn);border-color:var(--warn)">OFF</span>`:'') },
 
-  { key:'label',    label:'МЕТКА',    width:'120px', render:s=>s.label?esc(s.label):'—' },
-  { key:'type',     label:'ТИП',      width:'110px', render:s=>`<span class="pill">${TYPE_NAME[s.type]||'?'}</span>` },
-  { key:'interval', label:'ИНТЕРВАЛ', width:'90px',  render:s=>s.effective_interval_sec+'s' },
-  { key:'status',   label:'СТАТУС',   width:'110px', render:s=>statusCell(s.state) },
-  { key:'players',  label:'ИГРОКИ',   width:'110px', render:s=>playersCell(s.state) },
+  { key:'label',     label:'МЕТКА',       width:'120px', render:s=>s.label?esc(s.label):'—' },
+  { key:'type',      label:'ТИП',         width:'110px', render:s=>`<span class="pill">${TYPE_NAME[s.type]||'?'}</span>` },
+  { key:'interval',  label:'ИНТЕРВАЛ',    width:'90px',  render:s=>s.effective_interval_sec+'s' },
+  { key:'status',    label:'СТАТУС',      width:'110px', render:s=>statusCell(s.state) },
+  { key:'players',   label:'ИГРОКИ',      width:'110px', render:s=>playersCell(s.state) },
+  { key:'next_poll', label:'СЛЕД. ОПРОС', width:'130px', render:s=>nextPollCell(s) },
+  { key:'checked',   label:'ПОСЛЕДНИЙ',   width:'150px', render:s=>lastPollCell(s) },
+
   { key:'name',     label:'ИМЯ',      width:'160px', render:s=>trunc(s.state?.payload?.name) },
   { key:'motd',     label:'MOTD',     width:'200px', render:s=>trunc((s.state?.payload?.motd?.clean||[]).join(' / ')) },
   { key:'version',  label:'ВЕРСИЯ',   width:'150px', render:s=>trunc((s.state?.payload?.versions||[]).slice(0,3).join(', ')) },
@@ -97,44 +151,62 @@ const COLUMNS = [
   { key:'ip',       label:'IP:PORT',  width:'170px',
     render:s=>{const p=s.state?.payload; if(!p) return '—'; return esc(p.ip||'')+(p.port?':'+p.port:'');} },
 
-  { key:'checked',  label:'ОПРОС',    width:'150px',
+  { key:'actions',  label:'ДЕЙСТВИЯ', width:'230px', always:true, pin:'end',
     render:s=>{
-      const ts = s.state?.checked_at;
-      if (!ts) return '—';
-      const ageSec = Math.floor((Date.now() - ts) / 1000);
-      const eff = s.effective_interval_sec || 60;
-      const stale = ageSec > eff * 1.5;
-      const color = stale ? 'var(--warn)' : 'var(--dim)';
-      const badge = s.state?.from_cache
-        ? ` <span class="pill" style="background:var(--warn);color:#1a1305;border-color:var(--warn);font-weight:700">CACHE</span>`
-        : '';
-      return `<span data-rel-time="${ts}" title="${fmtTime(ts)}" style="color:${color}">${relTime(ts)}</span>${badge}`;
+      const pending = pendingPolls.has(s.id);
+      const cooling = cooldowns[s.id] && Date.now() < cooldowns[s.id];
+      const btnText = pending ? '…' : (cooling ? '⏳' : 'ОПРОС');
+      const disabled = pending || cooling;
+      return `<div class="actions">
+        <button class="ghost sm" data-poll-id="${s.id}" onclick="pollId(${s.id},event)" ${disabled?'disabled':''}>${btnText}</button>
+        <button class="ghost sm" onclick="editServer(${s.id},event)">ИЗМ</button>
+        <button class="danger sm" onclick="delServer(${s.id},event)">✕</button>
+      </div>`;
     } },
-
-  // Кнопка всегда рендерится как "ОПРОС" без disabled —
-  // pending-состояние накатывается через updateRowById (property sync,
-  // без пересоздания элемента → нет фликера).
-  { key:'actions',  label:'ДЕЙСТВИЯ', width:'230px', always:true,
-    render:s=>`<div class="actions">
-      <button class="ghost sm" data-poll-id="${s.id}" onclick="pollId(${s.id},event)">ОПРОС</button>
-      <button class="ghost sm" onclick="editServer(${s.id},event)">ИЗМ</button>
-      <button class="danger sm" onclick="delServer(${s.id},event)">✕</button>
-    </div>` },
 ];
 
-const DEFAULT_COLS = ['idx','image','address','type','interval','status','players','checked','actions'];
-const visibleCols = new Set(loadCols());
+const DEFAULT_COLS = ['idx','image','address','type','interval','status','players','next_poll','checked','actions'];
+let visibleCols = loadCols();     // порядок = порядок отображения
 
 function loadCols(){
   try {
     const raw = localStorage.getItem(COLS_KEY);
-    if (!raw) return DEFAULT_COLS;
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) && arr.length ? arr : DEFAULT_COLS;
-  } catch { return DEFAULT_COLS; }
+    let arr = null;
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) arr = parsed;
+    }
+    if (!arr) arr = [...DEFAULT_COLS];
+
+    // Миграция со старых дефолтов
+    const OLD1 = ['idx','image','address','type','interval','status','players','checked','actions'];
+    const OLD2 = ['idx','image','address','type','interval','status','players','next_poll','actions'];
+    const eq = (a,b) => a.length === b.length && a.every((k,i) => k === b[i]);
+    if (eq(arr, OLD1) || eq(arr, OLD2)) arr = [...DEFAULT_COLS];
+
+    // Гарантируем наличие always-колонок
+    const allKeys = new Set(COLUMNS.map(c => c.key));
+    arr = arr.filter(k => allKeys.has(k));
+    COLUMNS.forEach(c => {
+      if (c.always && !arr.includes(c.key)) arr.push(c.key);
+    });
+    return arr;
+  } catch { return [...DEFAULT_COLS]; }
 }
-function saveCols(){ localStorage.setItem(COLS_KEY, JSON.stringify([...visibleCols])); }
-const activeColumns = () => COLUMNS.filter(c => c.always || visibleCols.has(c.key));
+function saveCols(){ localStorage.setItem(COLS_KEY, JSON.stringify(visibleCols)); }
+const isVisible = k => visibleCols.includes(k);
+
+function activeColumns() {
+  const byKey = Object.fromEntries(COLUMNS.map(c => [c.key, c]));
+  const pinStart = COLUMNS.filter(c => c.pin === 'start');
+  const pinEnd   = COLUMNS.filter(c => c.pin === 'end');
+  const pinned   = new Set([...pinStart.map(c=>c.key), ...pinEnd.map(c=>c.key)]);
+  const middle = visibleCols
+    .filter(k => !pinned.has(k))
+    .map(k => byKey[k])
+    .filter(Boolean);
+  return [...pinStart, ...middle, ...pinEnd];
+}
 
 function filteredServers() {
   const q = ($('search')?.value || '').toLowerCase().trim();
@@ -144,7 +216,6 @@ function filteredServers() {
     (s.label || '').toLowerCase().includes(q));
 }
 
-// ---------- rendering ----------
 function buildRowHTML(s, i, cols) {
   return cols.map(c => `<td>${c.render(s, i) ?? ''}</td>`).join('');
 }
@@ -156,21 +227,71 @@ function attachRowHandlers(tr, s) {
   });
 }
 
+// ---------- drag-n-drop колонок ----------
+let draggingKey = null;
+
+function attachHeaderDnD() {
+  document.querySelectorAll('#thead th[data-col-key]').forEach(th => {
+    const key = th.dataset.colKey;
+    const col = COLUMNS.find(c => c.key === key);
+    if (!col || col.pin) return;
+
+    th.draggable = true;
+    th.addEventListener('dragstart', e => {
+      draggingKey = key;
+      th.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', key);
+    });
+    th.addEventListener('dragend', () => {
+      th.classList.remove('dragging');
+      draggingKey = null;
+      document.querySelectorAll('#thead th').forEach(x => x.classList.remove('drop-target'));
+    });
+    th.addEventListener('dragover', e => {
+      if (!draggingKey || draggingKey === key) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      th.classList.add('drop-target');
+    });
+    th.addEventListener('dragleave', () => th.classList.remove('drop-target'));
+    th.addEventListener('drop', e => {
+      e.preventDefault();
+      th.classList.remove('drop-target');
+      const srcKey = e.dataTransfer.getData('text/plain');
+      if (!srcKey || srcKey === key) return;
+      reorderColumn(srcKey, key);
+    });
+  });
+}
+
+function reorderColumn(srcKey, targetKey) {
+  const arr = [...visibleCols];
+  const srcIdx = arr.indexOf(srcKey);
+  const tgtIdx = arr.indexOf(targetKey);
+  if (srcIdx < 0 || tgtIdx < 0) return;
+  arr.splice(srcIdx, 1);
+  arr.splice(tgtIdx, 0, srcKey);
+  visibleCols = arr;
+  saveCols();
+  renderTable();
+}
+
+// ---------- rendering ----------
 function renderTable(){
   const cols = activeColumns();
   $('thead').innerHTML = '<tr>' + cols.map(c =>
-    `<th style="width:${c.width}">${esc(c.label)}</th>`).join('') + '</tr>';
+    `<th data-col-key="${c.key}" style="width:${c.width}">${esc(c.label)}</th>`).join('') + '</tr>';
+  attachHeaderDnD();
 
   const tbody = $('rows');
   tbody.innerHTML = '';
-
   const visible = filteredServers();
   if (!visible.length) {
     const msg = servers.length ? 'нет совпадений' : 'нет серверов — добавь первый';
     tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:var(--dim)">${msg}</td></tr>`;
     return;
   }
-
   visible.forEach((s, i) => {
     const tr = document.createElement('tr');
     tr.dataset.rowId = String(s.id);
@@ -180,7 +301,6 @@ function renderTable(){
     tr.innerHTML = buildRowHTML(s, i, cols);
     attachRowHandlers(tr, s);
     tbody.appendChild(tr);
-
     if (expanded.has(s.id)) {
       const dr = document.createElement('tr');
       dr.className = 'detail-row';
@@ -188,58 +308,65 @@ function renderTable(){
       tbody.appendChild(dr);
     }
   });
-
-  // Синхронизируем pending-состояние кнопок (для случая renderTable во время опроса)
-  servers.forEach(s => {
-    if (!pendingPolls.has(s.id)) return;
-    const btn = document.querySelector(`button[data-poll-id="${s.id}"]`);
-    if (btn) { btn.disabled = true; btn.textContent = '…'; }
-  });
 }
 
-// Точечное обновление строки. Кнопку ОПРОС не пересоздаём — правим property.
 function updateRowById(id){
   const s = servers.find(x => x.id === id);
   if (!s) return;
-
   const visible = filteredServers();
   const i = visible.findIndex(x => x.id === id);
   const tr = document.querySelector(`tr.expandable[data-row-id="${id}"]`);
-
   if (i < 0) { if (tr) tr.remove(); return; }
   if (!tr) { renderTable(); return; }
 
   const cols = activeColumns();
   const tds = tr.children;
-  const isPending = pendingPolls.has(id);
 
   cols.forEach((c, idx) => {
     const td = tds[idx];
     if (!td) return;
-
-    // Actions cell: сохраняем идентичность кнопки, обновляем только state.
     if (c.key === 'actions') {
       const pollBtn = td.querySelector('button[data-poll-id]');
       if (pollBtn) {
-        pollBtn.disabled = isPending;
-        pollBtn.textContent = isPending ? '…' : 'ОПРОС';
+        const pending = pendingPolls.has(id);
+        const cooling = cooldowns[id] && Date.now() < cooldowns[id];
+        pollBtn.disabled = pending || cooling;
+        pollBtn.textContent = pending ? '…' : (cooling ? '⏳' : 'ОПРОС');
         return;
       }
       td.innerHTML = c.render(s, i) ?? '';
       return;
     }
-
+    // Таймер-ячейки: сравниваем data-ts, чтобы не пересоздавать DOM на каждый тик.
+    if (c.key === 'next_poll' || c.key === 'checked') {
+      const el = td.querySelector('.live-timer');
+      const newTs = c.key === 'next_poll'
+        ? (s.state?.checked_at && s.effective_interval_sec
+            ? s.state.checked_at + s.effective_interval_sec * 1000 : null)
+        : (s.state?.checked_at || null);
+      if (el && newTs !== null && parseInt(el.dataset.ts, 10) === newTs) {
+        // ts не изменился — обновим только значок кеша, если нужно
+        if (c.key === 'checked') {
+          const hasBadge = !!td.querySelector('.cache-mark');
+          const needBadge = !!s.state?.from_cache;
+          if (hasBadge !== needBadge) {
+            td.innerHTML = c.render(s, i) ?? '';
+          }
+        }
+        return;
+      }
+      td.innerHTML = c.render(s, i) ?? '';
+      return;
+    }
     const newHTML = c.render(s, i) ?? '';
     if (td.innerHTML !== newHTML) td.innerHTML = newHTML;
   });
 
-  // flash/open классы
   const isOpen = expanded.has(id);
   const shouldFlash = flashing.has(id);
   const want = 'expandable' + (isOpen ? ' open' : '') + (shouldFlash ? ' flash' : '');
   if (tr.className !== want) tr.className = want;
 
-  // detail row
   let dr = tr.nextElementSibling;
   if (isOpen) {
     const detailHTML = `<td colspan="${cols.length}">${renderDetail(s)}</td>`;
@@ -272,10 +399,8 @@ function toggleExpand(id, ev){
 
 function renderServerCard(p, { withRaw = false } = {}){
   if (!p) return '<i style="color:var(--dim)">пусто</i>';
-
   const KV  = 'display:grid;grid-template-columns:180px 1fr;gap:4px 12px;font-size:12px';
   const LBL = 'color:var(--dim);font-weight:400';
-
   const pl = p.players || [];
   const motdLines = (p.motd?.clean||[]).join(' / ') || (p.motd?.raw||[]).join(' / ') || '—';
   const versions  = (p.versions||[]).slice(0,8).join(', ') + ((p.versions||[]).length>8?'…':'');
@@ -296,7 +421,6 @@ function renderServerCard(p, { withRaw = false } = {}){
     ${p.game_id>=0?`<b style="${LBL}">Game ID</b><span>${p.game_id}</span>`:''}
     ${p.serverid?`<b style="${LBL}">ServerID</b><span>${esc(p.serverid)}</span>`:''}
   </div>`;
-
   if (pl.length) {
     h += `<div class="sec-title">ИГРОКИ (${pl.length})</div>
       <div style="max-height:180px;overflow:auto;font-size:11px">
@@ -315,12 +439,16 @@ function renderColPicker(){
   const menu = $('colPickerMenu');
   const cols = COLUMNS.filter(c => !c.always);
   menu.innerHTML =
-    cols.map(c => `<label><input type="checkbox" data-col="${c.key}" ${visibleCols.has(c.key)?'checked':''}>${esc(c.label)}</label>`).join('')
+    cols.map(c => `<label><input type="checkbox" data-col="${c.key}" ${isVisible(c.key)?'checked':''}>${esc(c.label)}</label>`).join('')
     + `<div class="sep">ДЕЙСТВИЯ</div><button class="ghost" style="width:100%" onclick="resetCols()">СБРОСИТЬ</button>`;
   menu.querySelectorAll('input[type=checkbox]').forEach(cb => {
     cb.addEventListener('change', () => {
       const k = cb.dataset.col;
-      if (cb.checked) visibleCols.add(k); else visibleCols.delete(k);
+      if (cb.checked) {
+        if (!visibleCols.includes(k)) visibleCols.push(k);
+      } else {
+        visibleCols = visibleCols.filter(x => x !== k);
+      }
       saveCols(); renderTable();
     });
   });
@@ -331,15 +459,13 @@ function toggleColPicker(ev){
   $('colPickerMenu').classList.toggle('on');
 }
 function resetCols(){
-  visibleCols.clear();
-  DEFAULT_COLS.forEach(k => visibleCols.add(k));
+  visibleCols = [...DEFAULT_COLS];
   saveCols(); renderColPicker(); renderTable();
 }
 document.addEventListener('click', ev => {
   if (!ev.target.closest('.colpicker')) $('colPickerMenu').classList.remove('on');
 });
 
-// ---------- API ----------
 async function api(path, opts = {}) {
   const r = await fetch(path, { credentials: 'include', headers: { 'Content-Type': 'application/json' }, ...opts });
   const text = await r.text();
@@ -366,7 +492,7 @@ async function loadServers(){
   renderTable();
 }
 
-// ---------- SSE (batched states, dedup by checked_at) ----------
+// ---------- SSE ----------
 let es = null;
 let sseRetryTimer = null;
 
@@ -386,23 +512,15 @@ function connectEvents(){
       const dtos = JSON.parse(e.data);
       for (const dto of dtos) {
         const idx = servers.findIndex(x => x.id === dto.id);
-
-        // Дедуп: состояние пришло HTTP-ответом раньше SSE-батча — не мигаем.
         if (idx >= 0 && servers[idx].state && dto.state &&
             servers[idx].state.checked_at === dto.state.checked_at) {
-          servers[idx] = dto; // обновим icon_url и прочие поля без рендера
+          servers[idx] = dto;
           continue;
         }
-
         if (idx >= 0) servers[idx] = dto; else servers.push(dto);
-
         if (pendingPolls.has(dto.id)) continue;
-
         flashing.add(dto.id);
-        setTimeout(() => {
-          flashing.delete(dto.id);
-          updateRowById(dto.id);
-        }, 1600);
+        setTimeout(() => { flashing.delete(dto.id); updateRowById(dto.id); }, 1600);
         updateRowById(dto.id);
       }
     } catch (err) { console.error('sse parse', err); }
@@ -418,32 +536,47 @@ function connectEvents(){
 
 // ---------- IP check ----------
 async function checkAddr(){
+  if (checkingAddr) return;
   const addr = $('ipAddr').value.trim();
   if (!addr) return;
+
+  checkingAddr = true;
   const box = $('ipResult');
   box.className = 'result';
   box.style.display = 'block';
   box.textContent = '► опрос…';
-  const r = await api('/api/query', {
-    method: 'POST',
-    body: JSON.stringify({ address: addr, type: parseInt($('ipType').value, 10) }),
-  });
-  if (!r.ok) {
-    box.className = 'result err';
-    box.innerHTML = `<span style="color:var(--err)">${esc(r.data?.error || 'ошибка запроса')}</span>`;
-    return;
-  }
-  if (r.data.error) {
-    box.className = 'result err';
-    box.innerHTML = `<span style="color:var(--err)">${esc(r.data.error)}</span>`;
-    return;
-  }
+  try {
+    const r = await api('/api/query', {
+      method: 'POST',
+      body: JSON.stringify({ address: addr, type: parseInt($('ipType').value, 10) }),
+    });
+    if (!r.ok) {
+      box.className = 'result err';
+      box.innerHTML = `<span style="color:var(--err)">${esc(r.data?.error || 'ошибка запроса')}</span>`;
+      return;
+    }
+    if (r.data.error) {
+      box.className = 'result err';
+      box.innerHTML = `<span style="color:var(--err)">${esc(r.data.error)}</span>`;
+      return;
+    }
 
-  const badge = r.data.from_cache
-    ? `<div style="margin-bottom:8px"><span class="pill" style="background:var(--warn);color:#1a1305;border-color:var(--warn);font-weight:700">CACHE</span>
-       <span style="color:var(--dim);font-size:11px;margin-left:8px">из кеша — реальный запрос был недавно</span></div>`
-    : '';
-  box.innerHTML = badge + renderServerCard(r.data.payload, { withRaw: true });
+    const ts = r.data.checked_at;
+    const headerLine = r.data.from_cache
+      ? `<div style="margin-bottom:8px">
+           <span class="cache-mark" style="font-size:13px">💾</span>
+           <span style="color:var(--dim);font-size:11px;margin-left:6px">
+             из кеша — последний реальный опрос: <b>${fmtTime(ts)}</b>
+             <span style="color:#5a6473">(${fmtAgo(Math.floor((Date.now() - ts) / 1000))})</span>
+           </span>
+         </div>`
+      : `<div style="margin-bottom:8px;color:var(--dim);font-size:11px">
+           опрос выполнен: <b>${fmtTime(ts)}</b>
+         </div>`;
+    box.innerHTML = headerLine + renderServerCard(r.data.payload, { withRaw: true });
+  } finally {
+    checkingAddr = false;
+  }
 }
 
 // ---------- CRUD ----------
@@ -481,7 +614,6 @@ async function saveServer(){
   const r = await api(url, { method, body: JSON.stringify(body) });
   if (!r.ok) return alert(r.data?.error || 'Ошибка сохранения');
   closeModal('mAdd');
-
   if (!editingId && r.data) {
     servers.push(r.data);
     renderTable();
@@ -500,30 +632,34 @@ async function delServer(id, ev){
   if (!r.ok) return alert(r.data?.error || 'Ошибка удаления');
   expanded.delete(id);
   pendingPolls.delete(id);
+  delete cooldowns[id];
   await loadServers();
 }
 
 async function pollId(id, ev){
   if (ev) ev.stopPropagation();
   if (pendingPolls.has(id)) return;
+  if (cooldowns[id] && Date.now() < cooldowns[id]) return;
   const i = servers.findIndex(x => x.id === id);
   if (i < 0) return;
 
   pendingPolls.add(id);
-  updateRowById(id); // button → … через property sync
-
+  updateRowById(id);
   try {
     const r = await api(`/api/servers/${id}/poll`, { method: 'POST' });
     if (r.ok && r.data) {
       servers[i].state = r.data;
       if (r.data.from_cache) {
+        cooldowns[id] = Date.now() + 3000;
         flashing.add(id);
         setTimeout(() => { flashing.delete(id); updateRowById(id); }, 800);
       }
+    } else if (r.status === 429) {
+      cooldowns[id] = Date.now() + 5000;
     }
   } finally {
     pendingPolls.delete(id);
-    updateRowById(id); // button → ОПРОС через property sync
+    updateRowById(id);
   }
 }
 
@@ -540,7 +676,6 @@ async function logout(){
   location.replace('/auth');
 }
 
-// ---------- init ----------
 loadMe();
 loadServers();
 connectEvents();

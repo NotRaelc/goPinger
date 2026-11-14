@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -16,6 +17,19 @@ import (
 )
 
 var cfg Config
+
+// safeGo — единственное место запуска горутин. RecoverMiddleware покрывает
+// только горутину HTTP-запроса, но не детей. Это для долгоживущих циклов.
+func safeGo(fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("goroutine panic", "err", r, "stack", string(debug.Stack()))
+			}
+		}()
+		fn()
+	}()
+}
 
 func initDb(ctx context.Context) error {
 	pgCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
@@ -37,22 +51,19 @@ func initDb(ctx context.Context) error {
 		return err
 	}
 	pool = p
-	return requireTables(ctx, "users", "servers", "server_states")
-}
 
-func requireTables(ctx context.Context, names ...string) error {
-	for _, n := range names {
+	for _, t := range []string{"users", "servers", "server_states"} {
 		var ok bool
 		err := pool.QueryRow(ctx, `
 			SELECT EXISTS (
 				SELECT 1 FROM information_schema.tables
-				WHERE table_schema = 'public' AND table_name = $1
-			)`, n).Scan(&ok)
+				WHERE table_schema='public' AND table_name=$1
+			)`, t).Scan(&ok)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("required table %q missing - apply migrations", n)
+			return fmt.Errorf("required table %q missing - apply migrations", t)
 		}
 	}
 	return nil
@@ -69,23 +80,21 @@ func main() {
 		os.Exit(1)
 	}
 	if err := initRedis(ctx, cfg.RedisURL); err != nil {
-		slog.Error("Redis init failed. Install & start Redis", "err", err)
+		slog.Error("Redis init failed", "err", err)
 		os.Exit(1)
 	}
-
 	loadIconFiles()
-
 	validate = validator.New(validator.WithRequiredStructEnabled())
 
-	go startPoller(ctx)
-	go startRateLimiterCleanup(ctx)
+	safeGo(func() { startPoller(ctx) })
+	safeGo(func() { startRateLimiterCleanup(ctx) })
 
 	mux := http.NewServeMux()
 	Routes(mux)
-
 	handler := Chain(mux,
 		RecoverMiddleware,
 		RequestIDMiddleware,
+		SecurityHeadersMiddleware,
 		LoggingMiddleware,
 		CORSMiddleware,
 		GzipMiddleware,
@@ -101,12 +110,12 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	go func() {
-		slog.Info("HTTP listening", "addr", cfg.ListenAddr)
+	safeGo(func() {
+		slog.Info("HTTP listening", "addr", cfg.ListenAddr, "protocol", cfg.Protocol)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("HTTP server", "err", err)
 		}
-	}()
+	})
 
 	<-ctx.Done()
 	slog.Warn("shutting down...")

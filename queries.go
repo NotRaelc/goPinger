@@ -2,35 +2,79 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 
 	"goPinger/query"
 )
 
-// queryAddressWithType — низкоуровневая попытка опроса с учётом explicit-типа.
-// Не трогает rate-limit/lock — их обеспечивает fetchState.
+// effectiveInterval — единый источник интервала для сервера.
+// Приоритет: s.IntervalSec > intervalFor(userType or detected).
+func effectiveInterval(s Server, detected query.ServerType) time.Duration {
+	userType := queryTypeFromInt(s.Type)
+	var base time.Duration
+	if userType == query.ServerAuto && detected != query.ServerAuto {
+		base = intervalFor(detected)
+	} else {
+		base = intervalFor(userType)
+	}
+	if s.IntervalSec > 0 {
+		custom := time.Duration(s.IntervalSec) * time.Second
+		if custom < cfg.MinRealInterval {
+			custom = cfg.MinRealInterval
+		}
+		return custom
+	}
+	return base
+}
+
+func stateOK(p query.Server) ServerState {
+	return ServerState{OK: true, CheckedAt: time.Now().UnixMilli(), Payload: &p}
+}
+
+func stateErr(err error) ServerState {
+	return ServerState{OK: false, CheckedAt: time.Now().UnixMilli(), Error: err.Error()}
+}
+
+func saveState(ctx context.Context, serverID int64, st ServerState) error {
+	var payload any
+	if st.Payload != nil {
+		if b, err := json.Marshal(st.Payload); err == nil {
+			payload = b
+		}
+	}
+	_, err := pool.Exec(ctx, `
+		INSERT INTO server_states(server_id, ok, error, payload, checked_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (server_id) DO UPDATE
+		SET ok=$2, error=$3, payload=$4, checked_at=$5
+	`, serverID, st.OK, nullable(st.Error), payload, time.UnixMilli(st.CheckedAt))
+	return err
+}
+
+func nullable(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 func queryAddressWithType(ctx context.Context, address string, explicit query.ServerType) (ServerState, query.ServerType) {
 	qctx, cancel := context.WithTimeout(ctx, cfg.QueryTimeout)
 	defer cancel()
 
 	if explicit != query.ServerAuto {
-		resp := query.QueryServerOpts(qctx, address, query.Options{Type: explicit})
-		if resp.Error == nil {
+		if resp := query.QueryServerOpts(qctx, address, query.Options{Type: explicit}); resp.Error == nil {
 			cacheType(ctx, address, explicit)
 			return stateOK(resp.Payload), explicit
 		}
-		slog.Debug("explicit type failed, re-detecting",
-			"address", address, "type", explicit.String(), "err", resp.Error)
 	}
-
 	if t, ok := getCachedType(ctx, address); ok && t != explicit {
-		resp := query.QueryServerOpts(qctx, address, query.Options{Type: t})
-		if resp.Error == nil {
+		if resp := query.QueryServerOpts(qctx, address, query.Options{Type: t}); resp.Error == nil {
 			return stateOK(resp.Payload), t
 		}
 	}
-
 	resp := query.QueryServerOpts(qctx, address, query.Options{Type: query.ServerAuto})
 	if resp.Error != nil {
 		return stateErr(resp.Error), query.ServerAuto
@@ -42,25 +86,35 @@ func queryAddressWithType(ctx context.Context, address string, explicit query.Se
 	return stateOK(resp.Payload), t
 }
 
-// fetchState — единственная точка реальных запросов к серверам.
-// Rate-limit глобальный на адрес; конкурентные вызовы ждут кеш, а не плодят запросы.
-func fetchState(ctx context.Context, address string, explicit query.ServerType) (ServerState, query.ServerType, bool) {
-	if last, ok := getLastPoll(ctx, address); ok && time.Since(last) < cfg.MinRealInterval {
-		if st, _, ok := getStateCache(ctx, address); ok {
-			st.FromCache = true
-			return *st, gameKindToType(st.Payload.GameKind), true
+// fetchState — единственный источник реальных запросов.
+//   - кеш моложе intervalSec → возвращаем его (FromCache=true)
+//   - иначе — берём lock и делаем реальный запрос; проигравший гонку
+//     получает кеш победителя.
+//
+// Cache TTL = effectiveInterval от того, кто реально опросил.
+func fetchState(ctx context.Context, address string, explicit query.ServerType, intervalSec int) (ServerState, query.ServerType, bool) {
+	if st, _, ok := getStateCache(ctx, address); ok {
+		detected := query.ServerAuto
+		if st.Payload != nil {
+			detected = gameKindToType(st.Payload.GameKind)
 		}
-		if st, ok := waitForCache(ctx, address); ok {
+		ourInterval := effectiveInterval(Server{Type: int(explicit), IntervalSec: intervalSec}, detected)
+		age := time.Since(time.UnixMilli(st.CheckedAt))
+		if age < ourInterval {
 			st.FromCache = true
-			return *st, gameKindToType(st.Payload.GameKind), true
+			return *st, detected, true
 		}
 	}
 
 	release, ok := acquireServerLock(ctx, address)
 	if !ok {
 		if st, ok := waitForCache(ctx, address); ok {
+			detected := query.ServerAuto
+			if st.Payload != nil {
+				detected = gameKindToType(st.Payload.GameKind)
+			}
 			st.FromCache = true
-			return *st, gameKindToType(st.Payload.GameKind), true
+			return *st, detected, true
 		}
 		return ServerState{
 			OK:        false,
@@ -70,42 +124,16 @@ func fetchState(ctx context.Context, address string, explicit query.ServerType) 
 	}
 	defer release()
 
-	if last, ok := getLastPoll(ctx, address); ok && time.Since(last) < cfg.MinRealInterval {
-		if st, _, ok := getStateCache(ctx, address); ok {
-			st.FromCache = true
-			return *st, gameKindToType(st.Payload.GameKind), true
-		}
-	}
-
 	state, detected := queryAddressWithType(ctx, address, explicit)
-	saveStateCache(ctx, address, &state, intervalFor(detected))
+	ttl := effectiveInterval(Server{Type: int(explicit), IntervalSec: intervalSec}, detected)
+	saveStateCache(ctx, address, &state, ttl)
 	slog.Debug("real query", "address", address, "type", detected.String(), "ok", state.OK)
 	return state, detected, false
 }
 
 func bootstrapServerState(ctx context.Context, s Server) (ServerState, bool) {
-	ourType := queryTypeFromInt(s.Type)
-	ourInterval := intervalFor(ourType)
-
-	if cached, remaining, ok := getStateCache(ctx, s.Address); ok && cached.Payload != nil {
-		detected := gameKindToType(cached.Payload.GameKind)
-		matches := ourType == query.ServerAuto || ourType == detected
-		if matches {
-			effective := ourInterval
-			if ourType == query.ServerAuto {
-				effective = intervalFor(detected)
-			}
-			if effective >= remaining {
-				extendStateCache(ctx, s.Address, effective)
-				markPolled(ctx, s.ID, effective)
-				cached.FromCache = true
-				return *cached, true
-			}
-		}
-	}
-
-	st, detected, fromCache := fetchState(ctx, s.Address, ourType)
-	markPolled(ctx, s.ID, intervalFor(detected))
+	st, detected, fromCache := fetchState(ctx, s.Address, queryTypeFromInt(s.Type), s.IntervalSec)
+	markPolled(ctx, s.ID, effectiveInterval(s, detected))
 	return st, fromCache
 }
 
@@ -128,8 +156,6 @@ func queryTypeFromInt(t int) query.ServerType { return query.ServerType(t) }
 
 func intervalFor(t query.ServerType) time.Duration {
 	switch t {
-	case query.ServerSource:
-		return cfg.OtherInterval
 	case query.ServerMinecraftModern, query.ServerMinecraftLegacy, query.ServerMinecraftBedrock:
 		return cfg.MinecraftInterval
 	default:

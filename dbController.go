@@ -21,7 +21,7 @@ func readUserByUsername(ctx context.Context, username string) (User, error) {
 func readUserByToken(ctx context.Context, token string) (User, error) {
 	var user User
 	err := pool.QueryRow(ctx, `
-		SELECT username, token FROM users
+		SELECT username, COALESCE(token, '') FROM users
 		WHERE token = $1 AND (token_expires_at IS NULL OR token_expires_at > NOW())
 	`, token).Scan(&user.Username, &user.Token)
 	return user, err
@@ -62,7 +62,7 @@ func validateRegister(w http.ResponseWriter, r *http.Request, regUser RegisterUs
 	if err := insertUser(r.Context(), user); err != nil {
 		return err
 	}
-	setCookieToken(w, tokenValue)
+	setCookieToken(w, r, tokenValue)
 	return nil
 }
 
@@ -86,6 +86,6 @@ func validateLogin(w http.ResponseWriter, r *http.Request, logUser LoginUser) er
 	if err := updateUserToken(r.Context(), user); err != nil {
 		return err
 	}
-	setCookieToken(w, tokenValue)
+	setCookieToken(w, r, tokenValue)
 	return nil
 }

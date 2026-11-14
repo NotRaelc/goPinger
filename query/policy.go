@@ -10,11 +10,25 @@ import (
 )
 
 func isBlockedAddr(a netip.Addr) bool {
-	return a.IsLoopback() || a.IsUnspecified()
+	if a.Is4In6() {
+		a = a.Unmap()
+	}
+	if a.IsLoopback() || a.IsUnspecified() ||
+		a.IsPrivate() ||
+		a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
+		a.IsInterfaceLocalMulticast() || a.IsMulticast() {
+		return true
+	}
+	// CGNAT 100.64.0.0/10 не покрывается IsPrivate
+	if a.Is4() {
+		b := a.As4()
+		if b[0] == 100 && b[1] >= 64 && b[1] <= 127 {
+			return true
+		}
+	}
+	return false
 }
 
-// IsBlockedHost reports whether host should be rejected using the
-// default resolver.
 func IsBlockedHost(ctx context.Context, host string) bool {
 	return Options{}.isBlocked(ctx, host)
 }
@@ -31,12 +45,12 @@ func (o Options) isBlocked(ctx context.Context, host string) bool {
 	}
 	addrs, err := o.resolveHost(ctx, host)
 	if err != nil {
-		return false
+		// Fail-closed: не резолвится — не пускаем.
+		return true
 	}
 	return slices.ContainsFunc(addrs, isBlockedAddr)
 }
 
-// IsDialError reports whether err occurred during connection setup.
 func IsDialError(err error) bool {
 	var opErr *net.OpError
 	if !errors.As(err, &opErr) {

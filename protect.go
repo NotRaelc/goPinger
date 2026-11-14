@@ -14,14 +14,6 @@ var (
 	ErrForbidden = errors.New("forbidden")
 )
 
-// Валидация входных данных до любого похода в БД.
-func guardUsername(u string) error {
-	if u == "" || len(u) > 32 {
-		return fmt.Errorf("invalid username")
-	}
-	return nil
-}
-
 func guardAddress(a string) error {
 	a = strings.TrimSpace(a)
 	if a == "" || len(a) > 255 {
@@ -47,7 +39,19 @@ func guardLabel(l string) error {
 	return nil
 }
 
-// Проверка владения сервером до любого изменения. Возвращает 404/403 без лишних чтений.
+func guardServerQuota(ctx context.Context, userID string) error {
+	var n int
+	err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM servers WHERE user_id = $1`, userID).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n >= cfg.MaxServersPerUser {
+		return fmt.Errorf("server limit reached (%d)", cfg.MaxServersPerUser)
+	}
+	return nil
+}
+
+// Возвращаем 404 и для «не найден», и для «чужой» — чтобы не палить ID.
 func getServerForUser(ctx context.Context, userID string, id int64) (Server, error) {
 	if userID == "" || id <= 0 {
 		return Server{}, ErrNotFound
@@ -57,7 +61,7 @@ func getServerForUser(ctx context.Context, userID string, id int64) (Server, err
 		return s, err
 	}
 	if s.UserID != userID {
-		return Server{}, ErrForbidden
+		return Server{}, ErrNotFound
 	}
 	return s, nil
 }
