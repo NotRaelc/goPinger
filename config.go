@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"os"
 	"strconv"
 	"strings"
@@ -32,7 +33,36 @@ const (
 	maxInterval = time.Hour
 )
 
+// loadDotEnv читает .env файл и устанавливает переменные окружения.
+// Системные env vars имеют приоритет (важно для Docker/K8s).
+func loadDotEnv(filename string) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return // Файла нет — это нормально, работаем с системными env
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			val = strings.Trim(val, `"'`) // убираем кавычки
+			if os.Getenv(key) == "" {
+				os.Setenv(key, val)
+			}
+		}
+	}
+}
+
 func LoadConfig() Config {
+	loadDotEnv(".env") // Подхватываем локальный .env перед чтением
+
 	return Config{
 		DatabaseURL:        env("DATABASE_URL", ""),
 		RedisURL:           env("REDIS_URL", "redis://localhost:6379/0"),

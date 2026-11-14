@@ -89,6 +89,12 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 					"style-src 'self' 'unsafe-inline'; connect-src 'self'; "+
 					"frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 		}
+		// API-ответы не кешируются браузером
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			h.Set("Cache-Control", "no-store, must-revalidate")
+			h.Set("Pragma", "no-cache")
+			h.Set("Expires", "0")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

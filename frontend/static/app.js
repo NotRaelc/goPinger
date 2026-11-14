@@ -15,6 +15,7 @@ const pendingPolls = new Set();
 const cooldowns = {};
 let editingId = null;
 let checkingAddr = false;
+let staleRefreshCooldown = 0;
 
 // ---------- helpers ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
@@ -24,6 +25,8 @@ const fmtTime = ts => ts ? new Date(ts).toLocaleTimeString('ru-RU', { hour12: fa
 const fmtDateTime = ts => ts ? new Date(ts).toLocaleString('ru-RU', { hour12: false }) : '—';
 const trunc = s => s == null || s === '' ? '—'
   : `<span class="cell-trunc" title="${esc(s)}">${esc(s)}</span>`;
+
+const asArray = v => Array.isArray(v) ? v : (typeof v === 'string' ? [v] : []);
 
 function fmtAgo(sec) {
   if (sec < 0) sec = 0;
@@ -47,7 +50,6 @@ function fmtCountdown(sec) {
   return hh > 0 ? `${d}d ${hh}h` : `${d}d`;
 }
 
-// Живой тикер: обновляет только текст таймеров, не структуру DOM.
 setInterval(() => {
   const now = Date.now();
   document.querySelectorAll('.live-timer').forEach(el => {
@@ -142,8 +144,14 @@ const COLUMNS = [
   { key:'checked',   label:'ПОСЛЕДНИЙ',   width:'150px', render:s=>lastPollCell(s) },
 
   { key:'name',     label:'ИМЯ',      width:'160px', render:s=>trunc(s.state?.payload?.name) },
-  { key:'motd',     label:'MOTD',     width:'200px', render:s=>trunc((s.state?.payload?.motd?.clean||[]).join(' / ')) },
-  { key:'version',  label:'ВЕРСИЯ',   width:'150px', render:s=>trunc((s.state?.payload?.versions||[]).slice(0,3).join(', ')) },
+  { key:'motd',     label:'MOTD',     width:'200px', render:s=>{
+      const arr = asArray(s.state?.payload?.motd?.clean);
+      return trunc(arr.join(' / '));
+    } },
+  { key:'version',  label:'ВЕРСИЯ',   width:'150px', render:s=>{
+      const arr = asArray(s.state?.payload?.versions);
+      return trunc(arr.slice(0,3).join(', '));
+    } },
   { key:'protocol', label:'PROTO',    width:'80px',  render:s=>s.state?.payload?.protocol ?? '—' },
   { key:'software', label:'SOFTWARE', width:'130px', render:s=>trunc(s.state?.payload?.software) },
   { key:'gamemode', label:'GAMEMODE', width:'120px', render:s=>trunc(s.state?.payload?.gamemode) },
@@ -166,7 +174,7 @@ const COLUMNS = [
 ];
 
 const DEFAULT_COLS = ['idx','image','address','type','interval','status','players','next_poll','checked','actions'];
-let visibleCols = loadCols();     // порядок = порядок отображения
+let visibleCols = loadCols();
 
 function loadCols(){
   try {
@@ -178,13 +186,11 @@ function loadCols(){
     }
     if (!arr) arr = [...DEFAULT_COLS];
 
-    // Миграция со старых дефолтов
     const OLD1 = ['idx','image','address','type','interval','status','players','checked','actions'];
     const OLD2 = ['idx','image','address','type','interval','status','players','next_poll','actions'];
     const eq = (a,b) => a.length === b.length && a.every((k,i) => k === b[i]);
     if (eq(arr, OLD1) || eq(arr, OLD2)) arr = [...DEFAULT_COLS];
 
-    // Гарантируем наличие always-колонок
     const allKeys = new Set(COLUMNS.map(c => c.key));
     arr = arr.filter(k => allKeys.has(k));
     COLUMNS.forEach(c => {
@@ -212,7 +218,7 @@ function filteredServers() {
   const q = ($('search')?.value || '').toLowerCase().trim();
   if (!q) return servers;
   return servers.filter(s =>
-    s.address.toLowerCase().includes(q) ||
+    (s.address || '').toLowerCase().includes(q) ||
     (s.label || '').toLowerCase().includes(q));
 }
 
@@ -279,35 +285,48 @@ function reorderColumn(srcKey, targetKey) {
 
 // ---------- rendering ----------
 function renderTable(){
-  const cols = activeColumns();
-  $('thead').innerHTML = '<tr>' + cols.map(c =>
-    `<th data-col-key="${c.key}" style="width:${c.width}">${esc(c.label)}</th>`).join('') + '</tr>';
-  attachHeaderDnD();
+  try {
+    const cols = activeColumns();
+    $('thead').innerHTML = '<tr>' + cols.map(c =>
+      `<th data-col-key="${c.key}" style="width:${c.width}">${esc(c.label)}</th>`).join('') + '</tr>';
+    attachHeaderDnD();
 
-  const tbody = $('rows');
-  tbody.innerHTML = '';
-  const visible = filteredServers();
-  if (!visible.length) {
-    const msg = servers.length ? 'нет совпадений' : 'нет серверов — добавь первый';
-    tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:var(--dim)">${msg}</td></tr>`;
-    return;
-  }
-  visible.forEach((s, i) => {
-    const tr = document.createElement('tr');
-    tr.dataset.rowId = String(s.id);
-    tr.className = 'expandable'
-      + (expanded.has(s.id) ? ' open' : '')
-      + (flashing.has(s.id) ? ' flash' : '');
-    tr.innerHTML = buildRowHTML(s, i, cols);
-    attachRowHandlers(tr, s);
-    tbody.appendChild(tr);
-    if (expanded.has(s.id)) {
-      const dr = document.createElement('tr');
-      dr.className = 'detail-row';
-      dr.innerHTML = `<td colspan="${cols.length}">${renderDetail(s)}</td>`;
-      tbody.appendChild(dr);
+    const tbody = $('rows');
+    tbody.innerHTML = '';
+    const visible = filteredServers();
+    if (!visible.length) {
+      const msg = servers.length ? 'нет совпадений' : 'нет серверов — добавь первый';
+      tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:var(--dim)">${msg}</td></tr>`;
+      return;
     }
-  });
+    visible.forEach((s, i) => {
+      const tr = document.createElement('tr');
+      tr.dataset.rowId = String(s.id);
+      tr.className = 'expandable'
+        + (expanded.has(s.id) ? ' open' : '')
+        + (flashing.has(s.id) ? ' flash' : '');
+      try {
+        tr.innerHTML = buildRowHTML(s, i, cols);
+      } catch (e) {
+        console.error('render row failed', s, e);
+        tr.innerHTML = `<td colspan="${cols.length}" style="color:var(--err)">ошибка рендера (${esc(s.address || 'unknown')}): ${esc(e.message)}</td>`;
+      }
+      attachRowHandlers(tr, s);
+      tbody.appendChild(tr);
+      if (expanded.has(s.id)) {
+        const dr = document.createElement('tr');
+        dr.className = 'detail-row';
+        try {
+          dr.innerHTML = `<td colspan="${cols.length}">${renderDetail(s)}</td>`;
+        } catch (e) {
+          dr.innerHTML = `<td colspan="${cols.length}" style="color:var(--err)">ошибка рендера деталей: ${esc(e.message)}</td>`;
+        }
+        tbody.appendChild(dr);
+      }
+    });
+  } catch (e) {
+    console.error('renderTable failed', e);
+  }
 }
 
 function updateRowById(id){
@@ -337,15 +356,12 @@ function updateRowById(id){
       td.innerHTML = c.render(s, i) ?? '';
       return;
     }
-    // Таймер-ячейки: сравниваем data-ts, чтобы не пересоздавать DOM на каждый тик.
     if (c.key === 'next_poll' || c.key === 'checked') {
       const el = td.querySelector('.live-timer');
       const newTs = c.key === 'next_poll'
-        ? (s.state?.checked_at && s.effective_interval_sec
-            ? s.state.checked_at + s.effective_interval_sec * 1000 : null)
+        ? (s.next_poll_at || null)
         : (s.state?.checked_at || null);
       if (el && newTs !== null && parseInt(el.dataset.ts, 10) === newTs) {
-        // ts не изменился — обновим только значок кеша, если нужно
         if (c.key === 'checked') {
           const hasBadge = !!td.querySelector('.cache-mark');
           const needBadge = !!s.state?.from_cache;
@@ -401,9 +417,12 @@ function renderServerCard(p, { withRaw = false } = {}){
   if (!p) return '<i style="color:var(--dim)">пусто</i>';
   const KV  = 'display:grid;grid-template-columns:180px 1fr;gap:4px 12px;font-size:12px';
   const LBL = 'color:var(--dim);font-weight:400';
-  const pl = p.players || [];
-  const motdLines = (p.motd?.clean||[]).join(' / ') || (p.motd?.raw||[]).join(' / ') || '—';
-  const versions  = (p.versions||[]).slice(0,8).join(', ') + ((p.versions||[]).length>8?'…':'');
+  const pl = asArray(p.players);
+  const versArr = asArray(p.versions);
+  const motdArr = asArray(p.motd?.clean);
+  const rawArr = asArray(p.motd?.raw);
+  const motdLines = motdArr.join(' / ') || rawArr.join(' / ') || '—';
+  const versions  = versArr.slice(0,8).join(', ') + (versArr.length>8?'…':'');
 
   let h = `<div class="kv" style="${KV}">
     <b style="${LBL}">GameKind</b><span>${esc(p.game_kind||'—')}</span>
@@ -466,6 +485,7 @@ document.addEventListener('click', ev => {
   if (!ev.target.closest('.colpicker')) $('colPickerMenu').classList.remove('on');
 });
 
+// ---------- API ----------
 async function api(path, opts = {}) {
   const r = await fetch(path, { credentials: 'include', headers: { 'Content-Type': 'application/json' }, ...opts });
   const text = await r.text();
@@ -485,11 +505,76 @@ async function loadMe(){
   }
 }
 
+async function loadLimits(){
+  const r = await api('/api/limits');
+  const el = $('limitsPanel');
+  if (!el) return;
+  if (!r.ok || !r.data) {
+    el.innerHTML = `<div class="limits-h" style="color:var(--acc);font-weight:700;margin-bottom:8px;">ЛИМИТЫ</div><div style="color:var(--err)">недоступно</div>`;
+    return;
+  }
+  const l = r.data;
+  const row = (label, value) => 
+    `<div class="l-row" style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px;">
+       <span>${label}</span><b style="color:var(--fg);font-weight:700;font-variant-numeric:tabular-nums;">${value}</b>
+     </div>`;
+
+  el.innerHTML = `
+    <div class="limits-h" style="color:var(--acc);font-weight:700;letter-spacing:2px;margin-bottom:8px;border-bottom:1px solid var(--line);padding-bottom:6px;font-size:11px;">ЛИМИТЫ</div>
+    ${row('Серверов на юзера', l.max_servers_per_user)}
+    ${row('Мин. интервал опроса', l.min_real_interval + 's')}
+    ${row('Интервал MC', l.minecraft_interval + 's')}
+    ${row('Интервал прочих', l.other_interval + 's')}
+    ${row('Мин. длина пароля', l.password_min)}
+    ${row('Параллельных запросов', l.max_query_concurrent)}
+    ${row('SSE-соединений', l.sse_max)}
+  `;
+}
+
+// Загрузка серверов с retry + автообновлением устаревших.
 async function loadServers(){
-  const r = await api('/api/servers');
-  if (!r.ok) { console.error('loadServers', r.status); return; }
-  servers = r.data || [];
-  renderTable();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const r = await api('/api/servers');
+      if (r.ok) {
+        if (Array.isArray(r.data)) {
+          servers = r.data;
+          renderTable();
+          triggerStaleRefresh();
+          return;
+        }
+        console.warn('loadServers: unexpected data', r.data);
+      } else {
+        console.warn('loadServers', r.status, 'attempt', attempt + 1);
+      }
+    } catch (e) {
+      console.warn('loadServers error', e, 'attempt', attempt + 1);
+    }
+    await new Promise(res => setTimeout(res, 500 * (attempt + 1)));
+  }
+  console.error('loadServers failed after retries');
+  // Если таблица пуста и мы не смогли загрузить данные — выводим ошибку, а не "нет серверов"
+  if (!servers.length) {
+    $('rows').innerHTML = `<tr><td colspan="10" style="color:var(--err);text-align:center;padding:20px;">Не удалось загрузить сервера. Попробуйте перезагрузить страницу.</td></tr>`;
+  }
+}
+
+// Если в списке есть устаревшие или совсем без state — попросить бэк их освежить.
+async function triggerStaleRefresh(){
+  if (Date.now() < staleRefreshCooldown) return;
+  const stale = servers.filter(s => {
+    if (!s.enabled) return false;
+    if (!s.state || !s.state.checked_at) return true;
+    const eff = s.effective_interval_sec || 60;
+    return (Date.now() - s.state.checked_at) >= eff * 1000;
+  });
+  if (stale.length === 0) return;
+  staleRefreshCooldown = Date.now() + 5000;
+  try {
+    await api('/api/servers/refresh-stale', { method: 'POST' });
+  } catch (e) {
+    console.warn('refresh-stale failed', e);
+  }
 }
 
 // ---------- SSE ----------
@@ -510,14 +595,19 @@ function connectEvents(){
     setLive(true);
     try {
       const dtos = JSON.parse(e.data);
+      if (!Array.isArray(dtos)) return;
       for (const dto of dtos) {
         const idx = servers.findIndex(x => x.id === dto.id);
+        
+        if (pendingPolls.has(dto.id)) pendingPolls.delete(dto.id);
+
         if (idx >= 0 && servers[idx].state && dto.state &&
             servers[idx].state.checked_at === dto.state.checked_at) {
           servers[idx] = dto;
           continue;
         }
         if (idx >= 0) servers[idx] = dto; else servers.push(dto);
+        
         if (pendingPolls.has(dto.id)) continue;
         flashing.add(dto.id);
         setTimeout(() => { flashing.delete(dto.id); updateRowById(dto.id); }, 1600);
@@ -542,9 +632,16 @@ async function checkAddr(){
 
   checkingAddr = true;
   const box = $('ipResult');
+  const body = $('ipResultBody');
+  const btn = $('btnToggleResult');
+
   box.className = 'result';
-  box.style.display = 'block';
-  box.textContent = '► опрос…';
+  box.style.display = 'flex';        // чтобы flex-разметка шапки и тела работала
+  body.style.display = 'block';      // на случай, если было свернуто ранее
+  if (btn) btn.textContent = 'СВЕРНУТЬ';
+
+  body.textContent = '► опрос…';
+
   try {
     const r = await api('/api/query', {
       method: 'POST',
@@ -552,17 +649,17 @@ async function checkAddr(){
     });
     if (!r.ok) {
       box.className = 'result err';
-      box.innerHTML = `<span style="color:var(--err)">${esc(r.data?.error || 'ошибка запроса')}</span>`;
+      body.innerHTML = `<span style="color:var(--err)">${esc(r.data?.error || 'ошибка запроса')}</span>`;
       return;
     }
-    if (r.data.error) {
+    if (r.data?.error) {
       box.className = 'result err';
-      box.innerHTML = `<span style="color:var(--err)">${esc(r.data.error)}</span>`;
+      body.innerHTML = `<span style="color:var(--err)">${esc(r.data.error)}</span>`;
       return;
     }
 
-    const ts = r.data.checked_at;
-    const headerLine = r.data.from_cache
+    const ts = r.data?.checked_at;
+    const headerLine = r.data?.from_cache
       ? `<div style="margin-bottom:8px">
            <span class="cache-mark" style="font-size:13px">💾</span>
            <span style="color:var(--dim);font-size:11px;margin-left:6px">
@@ -573,9 +670,25 @@ async function checkAddr(){
       : `<div style="margin-bottom:8px;color:var(--dim);font-size:11px">
            опрос выполнен: <b>${fmtTime(ts)}</b>
          </div>`;
-    box.innerHTML = headerLine + renderServerCard(r.data.payload, { withRaw: true });
+    
+    body.innerHTML = headerLine + renderServerCard(r.data.payload, { withRaw: true });
   } finally {
     checkingAddr = false;
+  }
+}
+
+// Функция сворачивания результата
+function toggleResult(){
+  const body = $('ipResultBody');
+  const btn = $('btnToggleResult');
+  if (!body || !btn) return;
+
+  if (body.style.display === 'none') {
+    body.style.display = 'block';
+    btn.textContent = 'СВЕРНУТЬ';
+  } else {
+    body.style.display = 'none';
+    btn.textContent = 'РАЗВЕРНУТЬ';
   }
 }
 
@@ -665,9 +778,20 @@ async function pollId(id, ev){
 
 async function pollAll(){
   if (!servers.length) return;
-  if (!confirm('Опрос всех серверов?')) return;
+  if (!confirm('Отправить реальный запрос ко всем серверам прямо сейчас?')) return;
+  
+  servers.forEach(s => {
+    if (s.enabled) pendingPolls.add(s.id);
+  });
+  renderTable();
+
   const r = await api('/api/servers/poll-all', { method: 'POST' });
-  if (!r.ok) alert(r.data?.error || 'Ошибка');
+  if (!r.ok) {
+    alert(r.data?.error || 'Ошибка');
+    servers.forEach(s => pendingPolls.delete(s.id));
+    renderTable();
+    return;
+  }
 }
 
 async function logout(){
@@ -676,7 +800,9 @@ async function logout(){
   location.replace('/auth');
 }
 
+// ---------- init ----------
 loadMe();
+loadLimits();
 loadServers();
 connectEvents();
 setInterval(loadServers, 60_000);

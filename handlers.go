@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"goPinger/query"
@@ -127,6 +128,28 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------- API ----------
+
+type limitsResponse struct {
+	MaxServersPerUser  int `json:"max_servers_per_user"`
+	MinRealInterval    int `json:"min_real_interval"`
+	MinecraftInterval  int `json:"minecraft_interval"`
+	OtherInterval      int `json:"other_interval"`
+	PasswordMin        int `json:"password_min"`
+	MaxQueryConcurrent int `json:"max_query_concurrent"`
+	SSEMax             int `json:"sse_max"`
+}
+
+func apiLimits(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, limitsResponse{
+		MaxServersPerUser:  cfg.MaxServersPerUser,
+		MinRealInterval:    int(cfg.MinRealInterval.Seconds()),
+		MinecraftInterval:  int(cfg.MinecraftInterval.Seconds()),
+		OtherInterval:      int(cfg.OtherInterval.Seconds()),
+		PasswordMin:        cfg.PasswordMinLength,
+		MaxQueryConcurrent: cfg.MaxQueryConcurrent,
+		SSEMax:             cfg.SSEMaxConnections,
+	})
+}
 
 func apiMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"username": currentUser(r).Username})
@@ -268,6 +291,19 @@ func apiPollServer(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, statusForErr(err), "not found")
 		return
 	}
+
+	// Защита от спама (30 запросов в минуту на пользователя)
+	if !userLimiter.allow(user.Username, 30, time.Minute) {
+		// Лимит превышен — пробуем отдать кеш
+		if st, _, ok := getStateCache(r.Context(), s.Address); ok {
+			st.FromCache = true
+			writeJSON(w, 200, st)
+			return
+		}
+		writeJSONError(w, http.StatusTooManyRequests, "too many requests, try again later")
+		return
+	}
+
 	state, detected, _ := fetchState(r.Context(), s.Address, queryTypeFromInt(s.Type), s.IntervalSec)
 	_ = saveState(r.Context(), s.ID, state)
 	markPolled(r.Context(), s.ID, effectiveInterval(s, detected))
@@ -275,8 +311,62 @@ func apiPollServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, state)
 }
 
-// apiPollAll — снимает «когда опрашивать» у всех серверов юзера, чтобы
-// поллер подхватил их в ближайший тик. Никаких собственных горутин.
+func apiRefreshStale(w http.ResponseWriter, r *http.Request) {
+	user := currentUser(r)
+	list, err := listServers(r.Context(), user.Username)
+	if err != nil {
+		internalError(w, r, err)
+		return
+	}
+
+	var stale []ServerDTO
+	for _, dto := range list {
+		if !dto.Enabled {
+			continue
+		}
+		if dto.State == nil || dto.State.CheckedAt == 0 {
+			stale = append(stale, dto)
+			continue
+		}
+		eff := time.Duration(dto.EffectiveIntervalSec) * time.Second
+		if eff <= 0 {
+			eff = 60 * time.Second
+		}
+		if time.Since(time.UnixMilli(dto.State.CheckedAt)) >= eff {
+			stale = append(stale, dto)
+		}
+	}
+
+	if len(stale) > 0 {
+		bgCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 60*time.Second)
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 5)
+		for _, dto := range stale {
+			dto := dto
+			wg.Add(1)
+			safeGo(func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				s := Server{
+					ID: dto.ID, UserID: user.Username,
+					Address: dto.Address, Type: dto.Type,
+					IntervalSec: dto.IntervalSec,
+					Label:       dto.Label, Enabled: dto.Enabled,
+				}
+				state, detected, _ := fetchState(bgCtx, s.Address, queryTypeFromInt(s.Type), s.IntervalSec)
+				_ = saveState(bgCtx, s.ID, state)
+				markPolled(bgCtx, s.ID, effectiveInterval(s, detected))
+				publishState(user.Username, s, state)
+			})
+		}
+		safeGo(func() { wg.Wait(); cancel() })
+	}
+
+	writeJSON(w, 200, map[string]int{"refreshing": len(stale), "total": len(list)})
+}
+
 func apiPollAll(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
 	list, err := listServers(r.Context(), user.Username)
@@ -313,6 +403,20 @@ func apiQuery(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 400, err.Error())
 		return
 	}
+
+	user := currentUser(r)
+	// Защита от спама (10 запросов в секунду на пользователя)
+	if !userLimiter.allow(user.Username, 10, time.Second) {
+		// Лимит превышен — пробуем отдать кеш
+		if st, _, ok := getStateCache(r.Context(), in.Address); ok {
+			st.FromCache = true
+			writeJSON(w, 200, st)
+			return
+		}
+		writeJSONError(w, http.StatusTooManyRequests, "too many requests, try again later")
+		return
+	}
+
 	state, _, _ := fetchState(r.Context(), in.Address, query.ServerType(in.Type), 0)
 	writeJSON(w, 200, state)
 }
@@ -373,20 +477,26 @@ func Routes(mux *http.ServeMux) {
 	mux.Handle("GET /app", Chain(http.HandlerFunc(mainPage), NoCacheMiddleware, AuthMiddleware))
 
 	mux.Handle("GET /api/me", Chain(http.HandlerFunc(apiMe), APIAuthMiddleware))
-	mux.Handle("GET /api/servers", Chain(http.HandlerFunc(apiListServers),
-		APIAuthMiddleware, rateLimitUser(5, time.Second)))
+	mux.Handle("GET /api/limits", Chain(http.HandlerFunc(apiLimits), APIAuthMiddleware))
+
+	// Убрали rateLimitUser с этого роута, чтобы спам F5 не скрывал сервера
+	mux.Handle("GET /api/servers", Chain(http.HandlerFunc(apiListServers), APIAuthMiddleware))
+
 	mux.Handle("POST /api/servers", Chain(http.HandlerFunc(apiCreateServer),
 		APIAuthMiddleware, rateLimitUser(10, time.Minute)))
 	mux.Handle("PATCH /api/servers/{id}", Chain(http.HandlerFunc(apiUpdateServer),
 		APIAuthMiddleware, rateLimitUser(30, time.Minute)))
 	mux.Handle("DELETE /api/servers/{id}", Chain(http.HandlerFunc(apiDeleteServer),
 		APIAuthMiddleware, rateLimitUser(30, time.Minute)))
-	mux.Handle("POST /api/servers/{id}/poll", Chain(http.HandlerFunc(apiPollServer),
-		APIAuthMiddleware, rateLimitUser(20, time.Minute)))
-	mux.Handle("POST /api/servers/poll-all", Chain(http.HandlerFunc(apiPollAll),
-		APIAuthMiddleware, rateLimitUser(1, 5*time.Second)))
-	mux.Handle("POST /api/query", Chain(http.HandlerFunc(apiQuery),
-		APIAuthMiddleware, rateLimitUser(3, time.Second)))
+
+	// Убрали rateLimitUser с этих роутов — они легкие и уже защищены кешем
+	mux.Handle("POST /api/servers/{id}/poll", Chain(http.HandlerFunc(apiPollServer), APIAuthMiddleware))
+	mux.Handle("POST /api/servers/poll-all", Chain(http.HandlerFunc(apiPollAll), APIAuthMiddleware))
+	mux.Handle("POST /api/servers/refresh-stale", Chain(http.HandlerFunc(apiRefreshStale), APIAuthMiddleware))
+
+	// Оставили лимит только на произвольный query, так как это прямой запрос к левому серверу
+	mux.Handle("POST /api/query", Chain(http.HandlerFunc(apiQuery), APIAuthMiddleware))
+
 	mux.Handle("GET /api/events", Chain(http.HandlerFunc(apiEvents), APIAuthMiddleware))
 
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./frontend/static"))))

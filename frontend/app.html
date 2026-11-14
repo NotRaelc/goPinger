@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>goPinger // monitor</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230b0e13'/%3E%3Crect x='3' y='3' width='10' height='10' fill='%236fc79a'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/common.css">
-<link rel="stylesheet" href="/static/app.css">
-<script src="/static/app.js" defer></script>
+<link rel="stylesheet" href="/static/common.css?v=3">
+<link rel="stylesheet" href="/static/app.css?v=3">
+<script src="/static/app.js?v=3" defer></script>
 </head>
 <body>
 
@@ -22,19 +22,42 @@
 
 <section class="checker">
   <div class="sec-h"><span class="bar"></span><span class="txt">ПРОВЕРКА АДРЕСА</span></div>
-  <div class="row">
-    <input id="ipAddr" placeholder="play.example.com:25565"
-           onkeydown="if(event.key==='Enter')checkAddr()">
-    <select id="ipType" style="width:240px">
-      <option value="0">AUTO</option>
-      <option value="2">MINECRAFT JAVA (modern)</option>
-      <option value="3">MINECRAFT JAVA (legacy)</option>
-      <option value="4">MINECRAFT BEDROCK</option>
-      <option value="1">SOURCE (A2S)</option>
-    </select>
-    <button onclick="checkAddr()">ПРОВЕРИТЬ</button>
+  
+  <div class="checker-body" style="display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px;align-items:start;">
+    
+    <!-- ЛЕВАЯ КОЛОНКА: инпут + результат -->
+    <div class="checker-left">
+      <div class="row" style="display:flex;gap:8px;min-width:0;">
+        <input id="ipAddr" placeholder="play.example.com:25565"
+               style="flex:1;height:36px;font-size:14px;"
+               onkeydown="if(event.key==='Enter')checkAddr()">
+        <select id="ipType" style="flex:0 0 240px;width:240px;height:36px;">
+          <option value="0">AUTO</option>
+          <option value="2">MINECRAFT JAVA (modern)</option>
+          <option value="3">MINECRAFT JAVA (legacy)</option>
+          <option value="4">MINECRAFT BEDROCK</option>
+          <option value="1">SOURCE (A2S)</option>
+        </select>
+        <button style="flex:0 0 auto;height:36px;" onclick="checkAddr()">ПРОВЕРИТЬ</button>
+      </div>
+
+      <div class="result" id="ipResult">
+        <div class="result-header">
+          <span class="result-title">РЕЗУЛЬТАТ ОПРОСА</span>
+          <button class="ghost sm" onclick="toggleResult()" id="btnToggleResult">СВЕРНУТЬ</button>
+        </div>
+        <div class="result-body" id="ipResultBody"></div>
+      </div>
+    </div>
+
+    <!-- ПРАВАЯ КОЛОНКА: лимиты -->
+    <aside class="limits-panel" id="limitsPanel" 
+           style="background:var(--panel);border:2px solid var(--line);padding:12px 14px;font-size:11px;color:var(--dim);line-height:1.7;letter-spacing:.5px;box-shadow:0 0 0 1px var(--line-soft);">
+      <div class="limits-h" style="color:var(--acc);font-weight:700;letter-spacing:2px;margin-bottom:8px;border-bottom:1px solid var(--line);padding-bottom:6px;font-size:11px;">ЛИМИТЫ</div>
+      <div class="limits-loading" style="color:#5a6473;font-style:italic;">загрузка…</div>
+    </aside>
+
   </div>
-  <div class="result" id="ipResult"></div>
 </section>
 
 <main>

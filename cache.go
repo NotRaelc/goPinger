@@ -57,16 +57,6 @@ func markPolled(ctx context.Context, id int64, d time.Duration) {
 	redisClient.Set(ctx, keyNext(id), 1, d)
 }
 
-// remainingPoll — сколько осталось до следующего опроса сервера id.
-// -1 если опрос не запланирован (disabled или только что создан).
-func remainingPoll(ctx context.Context, id int64) time.Duration {
-	ttl, err := redisClient.TTL(ctx, keyNext(id)).Result()
-	if err != nil || ttl <= 0 {
-		return -1
-	}
-	return ttl
-}
-
 func clearUserCache(ctx context.Context, token string) {
 	redisClient.Del(ctx, keyUser(token))
 }
@@ -98,28 +88,26 @@ func acquireServerLock(ctx context.Context, a string) (func(), bool) {
 	return func() { redisClient.Del(context.Background(), keyLock(a)) }, true
 }
 
-// waitForCache ждёт появления кеша, пока lock держится. Ранний выход,
-// если writer снял lock без сохранения (упал).
+// waitForCache: подождать, пока другой writer положит результат в кеш.
+// Если lock снят, а кеша нет — writer упал; выходим сразу.
 func waitForCache(ctx context.Context, a string) (*ServerState, bool) {
 	deadline := time.Now().Add(cfg.LockWaitTimeout)
-	for time.Now().Before(deadline) {
+	for {
 		if st, _, ok := getStateCache(ctx, a); ok {
 			return st, true
 		}
 		if n, _ := redisClient.Exists(ctx, keyLock(a)).Result(); n == 0 {
-			time.Sleep(50 * time.Millisecond)
-			if st, _, ok := getStateCache(ctx, a); ok {
-				return st, true
-			}
+			return nil, false
+		}
+		if time.Now().After(deadline) {
 			return nil, false
 		}
 		select {
 		case <-ctx.Done():
 			return nil, false
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(150 * time.Millisecond):
 		}
 	}
-	return nil, false
 }
 
 func getStateCache(ctx context.Context, a string) (*ServerState, time.Duration, bool) {

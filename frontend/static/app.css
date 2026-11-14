@@ -5,13 +5,48 @@ header .who{color:var(--dim);margin-right:12px}
 
 .checker{padding:22px 20px;background:var(--bg);border-bottom:1px solid var(--line-soft)}
 .checker .sec-h{margin-bottom:12px}
-.checker .row{display:flex;gap:8px;max-width:1000px}
-.checker input{font-size:14px;height:36px}
-.checker select{height:36px}
-.checker button{height:36px}
 .checker .result{margin-top:14px;background:var(--panel);border-left:4px solid var(--acc2);
   padding:14px;font-size:12px;display:none}
 .checker .result.err{border-color:var(--err)}
+
+/* Grid: поле + панель лимитов гарантированно рядом */
+.checker-body{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) 280px;
+  gap:14px;
+  align-items:start;
+}
+.checker .row{display:flex;gap:8px;min-width:0}
+.checker .row input{flex:1;height:36px;font-size:14px}
+.checker .row select{flex:0 0 240px;width:240px;height:36px}
+.checker .row button{flex:0 0 auto;height:36px}
+
+.limits-panel{
+  background:var(--panel);
+  border:2px solid var(--line);
+  padding:12px 14px;
+  font-size:11px;
+  color:var(--dim);
+  line-height:1.7;
+  letter-spacing:.5px;
+  box-shadow:0 0 0 1px var(--line-soft);
+}
+.limits-h{
+  color:var(--acc);
+  font-weight:700;
+  letter-spacing:2px;
+  margin-bottom:8px;
+  border-bottom:1px solid var(--line);
+  padding-bottom:6px;
+  font-size:11px;
+}
+.limits-panel .l-row{display:flex;justify-content:space-between;gap:8px}
+.limits-panel .l-row b{color:var(--fg);font-weight:700;font-variant-numeric:tabular-nums}
+.limits-loading{color:#5a6473;font-style:italic}
+
+@media (max-width: 900px){
+  .checker-body{grid-template-columns:1fr}
+}
 
 main{padding:22px 20px}
 .toolbar{display:flex;justify-content:space-between;align-items:center;
@@ -89,9 +124,6 @@ pre.json .j-null{color:var(--j-null)}
 .modal label{display:block;color:var(--dim);font-size:11px;margin:12px 0 4px;letter-spacing:1px}
 .modal .actions{display:flex;gap:8px;margin-top:18px;justify-content:flex-end}
 
-.next-poll{font-variant-numeric:tabular-nums}
-.next-poll.due{color:var(--warn);font-weight:700}
-
 /* Drag-n-drop заголовков */
 th[draggable="true"]{cursor:grab;user-select:none;transition:background-color .1s ease}
 th[draggable="true"]:hover{background:var(--panel2)}
@@ -99,9 +131,47 @@ th[draggable="true"]:active{cursor:grabbing}
 th.dragging{opacity:.35}
 th.drop-target{box-shadow:inset 3px 0 0 var(--acc2)}
 
-/* Живой таймер — стабильная ширина цифр */
 .live-timer{font-variant-numeric:tabular-nums}
-
-/* Маленькая метка кеша */
 .cache-mark{display:inline-block;font-size:11px;line-height:1;padding:0 2px;
   cursor:help;filter:grayscale(.2)}
+
+/* Левая колонка с полем и результатом */
+.checker-left{
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Сам блок результата */
+.checker .result{
+  margin-top: 14px;
+  background: var(--panel);
+  border-left: 4px solid var(--acc2);
+  padding: 14px;
+  font-size: 12px;
+  display: none;
+  flex-direction: column;
+}
+.checker .result.err{
+  border-color: var(--err);
+}
+
+/* Шапка результата (кнопка свернуть) */
+.result-header{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+.result-title{
+  color: var(--acc2);
+  font-size: 11px;
+  letter-spacing: 2px;
+  font-weight: 700;
+}
+.result-body{
+  /* Чтобы содержимое не вылезало, если оно большое */
+  min-width: 0;
+}

@@ -137,16 +137,21 @@ func listServersCached(ctx context.Context, userID string) ([]ServerDTO, error) 
 	if b, err := redisClient.Get(ctx, key).Bytes(); err == nil {
 		var out []ServerDTO
 		if json.Unmarshal(b, &out) == nil {
+			if out == nil {
+				out = []ServerDTO{}
+			}
 			return out, nil
 		}
 	}
 	v, err, _ := listSF.Do(userID, func() (any, error) {
-		out, err := listServers(ctx, userID)
+		sfCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		out, err := listServers(sfCtx, userID)
 		if err != nil {
 			return nil, err
 		}
 		if b, e := json.Marshal(out); e == nil {
-			redisClient.Set(ctx, key, b, 3*time.Second)
+			redisClient.Set(context.Background(), key, b, 3*time.Second)
 		}
 		return out, nil
 	})
@@ -172,7 +177,7 @@ func listServers(ctx context.Context, userID string) ([]ServerDTO, error) {
 	}
 	defer rows.Close()
 
-	var out []ServerDTO
+	out := make([]ServerDTO, 0)
 	for rows.Next() {
 		var (
 			dto       ServerDTO
@@ -211,7 +216,7 @@ func listServers(ctx context.Context, userID string) ([]ServerDTO, error) {
 		return nil, err
 	}
 
-	// Точный next_poll_at = now + TTL(keyNext) из Redis (совпадает с поллером).
+	// next_poll_at = now + TTL(keyNext(id)), чтобы точно совпадать с поллером.
 	if len(out) > 0 {
 		pipe := redisClient.Pipeline()
 		cmds := make([]*redis.DurationCmd, len(out))
